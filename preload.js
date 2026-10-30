@@ -44,6 +44,8 @@ const state = {
   playerRoot: null
 };
 
+let appSettings = null; // сводка настроек из главного процесса
+
 /* --------------------- Управление плеером (DOM-клики) -------------------- */
 
 const PLAYER_ROOT_SELECTORS = [
@@ -598,6 +600,281 @@ function setupIpcCommands() {
   });
 }
 
+/* ------------------- Настройки, темы и панель управления ------------------ */
+
+const THEME_PRESETS = {
+  default: { background: '#141414', cards: '#1d1d22', accent: '#0077ff', radius: 16 },
+  oled: { background: '#000000', cards: '#101014', accent: '#0077ff', radius: 14 },
+  midnight: { background: '#0e1322', cards: '#172033', accent: '#5b8cff', radius: 18 },
+  light: { background: '#edeef0', cards: '#ffffff', accent: '#0077ff', radius: 16 }
+};
+
+/** Переопределение дизайн-токенов VKUI: так красится весь интерфейс ВК. */
+const VKUI_OVERRIDE_CSS = `
+  :root {
+    --vkui--color_background: var(--vkwave-bg) !important;
+    --vkui--color_background_page: var(--vkwave-bg) !important;
+    --vkui--color_background_content: var(--vkwave-cards) !important;
+    --vkui--color_background_secondary: var(--vkwave-cards) !important;
+    --vkui--color_background_tertiary: var(--vkwave-cards) !important;
+    --vkui--color_background_accent: var(--vkwave-accent) !important;
+    --vkui--color_background_accent_tint: var(--vkwave-accent) !important;
+    --vkui--color_stroke_accent: var(--vkwave-accent) !important;
+    --vkui--color_icon_accent: var(--vkwave-accent) !important;
+    --vkui--color_text_link: var(--vkwave-accent) !important;
+    --vkui--size_border_radius--regular: var(--vkwave-radius) !important;
+    --vkui--size_border_radius: var(--vkwave-radius) !important;
+  }
+  body { background: var(--vkwave-bg) !important; }
+`;
+
+let themeStyleEl = null;
+
+function applyTheme(s) {
+  const t = (s && s.theme) || {};
+  const root = document.documentElement;
+  root.style.setProperty('--vkwave-bg', t.background || '#141414');
+  root.style.setProperty('--vkwave-cards', t.cards || '#1d1d22');
+  root.style.setProperty('--vkwave-accent', t.accent || '#0077ff');
+  root.style.setProperty('--vkwave-radius', `${Number(t.radius) || 16}px`);
+
+  if (!themeStyleEl || !themeStyleEl.isConnected) {
+    themeStyleEl = document.createElement('style');
+    themeStyleEl.id = 'vkwave-theme';
+    (document.head || document.documentElement).appendChild(themeStyleEl);
+  }
+  // Пресет «default» = родная тёмная тема ВК, ничего не перекрашиваем.
+  themeStyleEl.textContent = t.preset && t.preset !== 'default' ? VKUI_OVERRIDE_CSS : '';
+}
+
+const PANEL_CSS = `
+  #vkwave-panel {
+    position: fixed; top: 46px; right: 12px; width: 322px;
+    background: #17171b; color: #e8eaf0;
+    border: 1px solid #2a2a31; border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .5);
+    padding: 14px; z-index: 2147483640;
+    font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+    transition: transform .18s ease, opacity .18s ease;
+  }
+  #vkwave-panel.vkwave-hidden { transform: translateX(24px); opacity: 0; pointer-events: none; }
+  #vkwave-panel .vkwave-panel__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  #vkwave-panel .vkwave-panel__title { font-weight: 600; font-size: 14px; }
+  #vkwave-panel .vkwave-panel__x { background: none; border: 0; color: #9aa0ab; font-size: 14px; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
+  #vkwave-panel .vkwave-panel__x:hover { background: #232329; color: #fff; }
+  #vkwave-panel .vkwave-panel__section { margin: 10px 0 6px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #7d8590; }
+  #vkwave-panel .vkwave-panel__presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  #vkwave-panel .vkwave-chip { background: #232329; color: #e8eaf0; border: 1px solid #2f2f37; border-radius: 999px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  #vkwave-panel .vkwave-chip.vkwave-active { background: var(--vkwave-accent, #0077ff); border-color: transparent; color: #fff; }
+  #vkwave-panel .vkwave-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
+  #vkwave-panel input[type="color"] { width: 44px; height: 26px; border: 1px solid #2f2f37; border-radius: 8px; background: #232329; padding: 2px; cursor: pointer; }
+  #vkwave-panel input[type="range"] { width: 150px; accent-color: var(--vkwave-accent, #0077ff); }
+  #vkwave-panel input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--vkwave-accent, #0077ff); cursor: pointer; }
+  #vkwave-panel .vkwave-check { cursor: pointer; }
+  #vkwave-panel .vkwave-panel__actions { display: flex; gap: 8px; margin-top: 12px; }
+  #vkwave-panel .vkwave-btn { flex: 1; background: #232329; color: #e8eaf0; border: 1px solid #2f2f37; border-radius: 10px; padding: 7px 6px; cursor: pointer; font-size: 12px; }
+  #vkwave-panel .vkwave-btn:hover { background: #2b2b33; }
+  #vkwave-panel .vkwave-btn--ghost { background: transparent; }
+  #vkwave-panel .vkwave-panel__hint { margin-top: 10px; font-size: 11px; color: #7d8590; }
+`;
+
+const PANEL_HTML = `
+  <div class="vkwave-panel__head">
+    <span class="vkwave-panel__title">🌊 VK Wave · Настройки</span>
+    <button id="vkwave-close" class="vkwave-panel__x" title="Закрыть (Ctrl+Shift+T)">✕</button>
+  </div>
+
+  <div class="vkwave-panel__section">Тема</div>
+  <div class="vkwave-panel__presets">
+    <button data-preset="default" class="vkwave-chip">VK Dark</button>
+    <button data-preset="oled" class="vkwave-chip">OLED</button>
+    <button data-preset="midnight" class="vkwave-chip">Midnight</button>
+    <button data-preset="light" class="vkwave-chip">Light</button>
+  </div>
+  <label class="vkwave-row">Фон окна <input type="color" id="vkwave-bg-input"></label>
+  <label class="vkwave-row">Карточки <input type="color" id="vkwave-cards-input"></label>
+  <label class="vkwave-row">Акцент <input type="color" id="vkwave-accent-input"></label>
+  <label class="vkwave-row">Скругления <input type="range" id="vkwave-radius-input" min="0" max="32" step="2"></label>
+
+  <div class="vkwave-panel__section">Поведение</div>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-musiconly"> Только музыка</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-hotkeys"> Хоткеи (Space, Ctrl+←/→)</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autolaunch"> Запускать с Windows</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-startintray"> Стартовать в трее</label>
+
+  <div class="vkwave-panel__actions">
+    <button id="vkwave-copy" class="vkwave-btn">Копировать тему</button>
+    <button id="vkwave-paste" class="vkwave-btn">Вставить</button>
+    <button id="vkwave-reset" class="vkwave-btn vkwave-btn--ghost">Сброс</button>
+  </div>
+  <div class="vkwave-panel__hint">Внешне ВК красится через VKUI-переменные: если отдельные элементы остались старого цвета — у ВК просто свои локальные токены, остальное перекрашивается.</div>
+`;
+
+function flashButton(panel, selector, text) {
+  const btn = panel.querySelector(selector);
+  if (!btn) return;
+  const original = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => {
+    btn.textContent = original;
+  }, 1200);
+}
+
+function syncPanel(s) {
+  if (!s) return;
+  const panel = document.getElementById('vkwave-panel');
+  if (!panel) return;
+  const t = s.theme || {};
+  const setValue = (id, value) => {
+    const el = panel.querySelector(`#${id}`);
+    if (el) el.value = value;
+  };
+  setValue('vkwave-bg-input', t.background);
+  setValue('vkwave-cards-input', t.cards);
+  setValue('vkwave-accent-input', t.accent);
+  setValue('vkwave-radius-input', Number(t.radius) || 16);
+  panel.querySelectorAll('[data-preset]').forEach((chip) => {
+    chip.classList.toggle('vkwave-active', chip.dataset.preset === t.preset);
+  });
+  const setChecked = (id, value) => {
+    const el = panel.querySelector(`#${id}`);
+    if (el) el.checked = !!value;
+  };
+  setChecked('vkwave-musiconly', s.musicOnly);
+  setChecked('vkwave-hotkeys', s.hotkeys);
+  setChecked('vkwave-autolaunch', s.autoLaunch);
+  setChecked('vkwave-startintray', s.startInTray);
+}
+
+function buildPanel() {
+  if (document.getElementById('vkwave-panel')) return;
+
+  const style = document.createElement('style');
+  style.id = 'vkwave-panel-style';
+  style.textContent = PANEL_CSS;
+  (document.head || document.documentElement).appendChild(style);
+
+  const panel = document.createElement('div');
+  panel.id = 'vkwave-panel';
+  panel.className = 'vkwave-hidden';
+  panel.innerHTML = PANEL_HTML;
+  document.body.appendChild(panel);
+
+  panel.querySelectorAll('[data-preset]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const preset = chip.dataset.preset;
+      sendSettings({ theme: { ...THEME_PRESETS[preset], preset } });
+    });
+  });
+
+  const currentTheme = () => (appSettings && appSettings.theme) || THEME_PRESETS.default;
+
+  const bindColor = (id, key) => {
+    const el = panel.querySelector(`#${id}`);
+    el.addEventListener('input', () => {
+      sendSettings({ theme: { ...currentTheme(), [key]: el.value, preset: 'custom' } });
+    });
+  };
+  bindColor('vkwave-bg-input', 'background');
+  bindColor('vkwave-cards-input', 'cards');
+  bindColor('vkwave-accent-input', 'accent');
+
+  const radius = panel.querySelector('#vkwave-radius-input');
+  radius.addEventListener('input', () => {
+    sendSettings({ theme: { ...currentTheme(), radius: Number(radius.value), preset: 'custom' } });
+  });
+
+  const bindCheckbox = (id, key) => {
+    const el = panel.querySelector(`#${id}`);
+    el.addEventListener('change', () => sendSettings({ [key]: el.checked }));
+  };
+  bindCheckbox('vkwave-musiconly', 'musicOnly');
+  bindCheckbox('vkwave-hotkeys', 'hotkeys');
+  bindCheckbox('vkwave-autolaunch', 'autoLaunch');
+  bindCheckbox('vkwave-startintray', 'startInTray');
+
+  panel.querySelector('#vkwave-close').addEventListener('click', () => togglePanel());
+
+  panel.querySelector('#vkwave-copy').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(appSettings.theme, null, 2));
+      flashButton(panel, '#vkwave-copy', 'Скопировано ✓');
+    } catch (_) {
+      flashButton(panel, '#vkwave-copy', 'Не удалось');
+    }
+  });
+
+  panel.querySelector('#vkwave-paste').addEventListener('click', async () => {
+    try {
+      const parsed = JSON.parse(await navigator.clipboard.readText());
+      if (!parsed || typeof parsed !== 'object') throw new Error('not a theme');
+      sendSettings({ theme: { ...parsed, preset: 'custom' } });
+      flashButton(panel, '#vkwave-paste', 'Загружено ✓');
+    } catch (_) {
+      flashButton(panel, '#vkwave-paste', 'Не тема');
+    }
+  });
+
+  panel.querySelector('#vkwave-reset').addEventListener('click', () => {
+    sendSettings({ theme: { ...THEME_PRESETS.default, preset: 'default' } });
+  });
+
+  if (appSettings) syncPanel(appSettings);
+}
+
+function togglePanel() {
+  if (!document.body) return;
+  buildPanel();
+  const panel = document.getElementById('vkwave-panel');
+  if (panel) panel.classList.toggle('vkwave-hidden');
+}
+
+async function sendSettings(patch) {
+  try {
+    const updated = await ipcRenderer.invoke('settings:set', patch);
+    appSettings = updated;
+    applyTheme(updated);
+    syncPanel(updated);
+  } catch (_) {
+    /* настройки недоступны — изменения не сохранятся */
+  }
+}
+
+/* ------------------------------ Хоткеи плеера ----------------------------- */
+
+function isEditableTarget(target) {
+  if (!target || !target.tagName) return false;
+  const tag = target.tagName.toLowerCase();
+  return (
+    tag === 'input' ||
+    tag === 'textarea' ||
+    tag === 'select' ||
+    (target.isContentEditable === true)
+  );
+}
+
+function setupHotkeys() {
+  window.addEventListener(
+    'keydown',
+    (event) => {
+      if (!appSettings || !appSettings.hotkeys) return;
+      if (isEditableTarget(event.target)) return; // не мешаем печатать в поиске
+
+      if (event.ctrlKey && !event.shiftKey && !event.altKey && event.code === 'ArrowRight') {
+        event.preventDefault();
+        pressControl('next');
+      } else if (event.ctrlKey && !event.shiftKey && !event.altKey && event.code === 'ArrowLeft') {
+        event.preventDefault();
+        pressControl('previous');
+      } else if (!event.ctrlKey && !event.altKey && !event.metaKey && event.code === 'Space') {
+        event.preventDefault();
+        handleTransportAction(state.isPlaying ? 'pause' : 'play');
+      }
+    },
+    true
+  );
+}
+
 /* --------------------------------- Запуск -------------------------------- */
 
 function init() {
@@ -605,6 +882,25 @@ function init() {
   setupMediaElementListeners();
   setupMutationObserver();
   setupIpcCommands();
+
+  // Настройки и панель VK Wave (Ctrl+Shift+T / пункт в трее).
+  ipcRenderer.on('settings-toggle', () => togglePanel());
+  ipcRenderer.on('settings-updated', (_event, s) => {
+    appSettings = s;
+    applyTheme(s);
+    syncPanel(s);
+  });
+  ipcRenderer
+    .invoke('settings:get')
+    .then((s) => {
+      appSettings = s;
+      applyTheme(s);
+      syncPanel(s);
+    })
+    .catch(() => {});
+  buildPanel();
+  setupHotkeys();
+
   runExtraction();
   setInterval(runExtraction, POLL_INTERVAL_MS);
 }

@@ -19,6 +19,7 @@ const {
   session
 } = require('electron');
 const path = require('path');
+const fs = require('fs');
 
 const { DiscordPresence } = require('./discord');
 
@@ -29,6 +30,74 @@ app.userAgentFallback = app.userAgentFallback
   .replace(/\s*Electron\/[\d.]+/i, '')
   .replace(/\s*VK Wave\/[\d.]+/i, '')
   .trim();
+
+/* ------------------------------- Настройки ------------------------------- */
+
+const DEFAULT_SETTINGS = {
+  musicOnly: true,   // «Только музыка»: редирект на /music + скрытие лишнего ВК
+  hotkeys: true,     // Space — пауза, Ctrl+←/→ — треки
+  autoLaunch: false, // запускать с Windows
+  startInTray: false, // стартовать свёрнутым в трей
+  theme: {
+    preset: 'default', // default | oled | midnight | light | custom
+    background: '#141414',
+    cards: '#1d1d22',
+    accent: '#0077ff',
+    radius: 16
+  }
+};
+
+let settings = { ...DEFAULT_SETTINGS, theme: { ...DEFAULT_SETTINGS.theme } };
+
+function settingsFile() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function loadSettings() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
+    settings = {
+      ...DEFAULT_SETTINGS,
+      ...raw,
+      theme: { ...DEFAULT_SETTINGS.theme, ...(raw && raw.theme ? raw.theme : {}) }
+    };
+  } catch (_) {
+    settings = { ...DEFAULT_SETTINGS, theme: { ...DEFAULT_SETTINGS.theme } };
+  }
+}
+
+function saveSettings() {
+  try {
+    fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2), 'utf8');
+  } catch (_) {
+    /* не записали — настройки не сохранятся до следующего раза */
+  }
+}
+
+function mergeSettings(current, patch) {
+  if (!patch || typeof patch !== 'object') return current;
+  const next = { ...current, ...patch };
+  next.theme = { ...current.theme, ...(patch.theme || {}) };
+  return next;
+}
+
+function isLightColor(hexColor) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hexColor || '');
+  if (!match) return false;
+  const int = parseInt(match[1], 16);
+  const r = (int >> 16) & 255;
+  const g = (int >> 8) & 255;
+  const b = int & 255;
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
+}
+
+function applyAutoLaunch() {
+  try {
+    app.setLoginItemSettings({ openAtLogin: !!settings.autoLaunch, args: ['--hidden'] });
+  } catch (_) {
+    /* недоступно в некоторых portable-сценариях */
+  }
+}
 
 const VK_MUSIC_URL = 'https://vk.com/music';
 const WINDOW_TITLE = 'VK Wave';
@@ -98,7 +167,10 @@ function createWindow() {
     }
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  const startHidden = process.argv.includes('--hidden') || settings.startInTray;
+  mainWindow.once('ready-to-show', () => {
+    if (!startHidden) mainWindow.show();
+  });
 
   // Крестик сворачивает окно в трей, а не закрывает приложение.
   mainWindow.on('close', (event) => {
@@ -120,6 +192,10 @@ function createWindow() {
     event.preventDefault();
     shell.openExternal(url);
   });
+
+  // Режим «Только музыка»: любые навигации вне музыкального раздела — назад в плеер.
+  mainWindow.webContents.on('did-navigate', (_event, url) => enforceMusicOnly(url));
+  mainWindow.webContents.on('did-navigate-in-page', (_event, url) => enforceMusicOnly(url));
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isVkUrl(url)) {
@@ -145,6 +221,10 @@ function createWindow() {
     if (input.key === 'F12' || (ctrl && input.shift && key === 'i')) {
       mainWindow.webContents.toggleDevTools();
       event.preventDefault();
+    } else if (ctrl && input.shift && key === 't') {
+      // Ctrl+Shift+T — панель настроек VK Wave.
+      sendPlayerCommand('settings-toggle');
+      event.preventDefault();
     } else if (ctrl && !input.shift && key === 'r') {
       mainWindow.webContents.reload();
       event.preventDefault();
@@ -164,7 +244,7 @@ function injectTitleBarStyles() {
     body {
       padding-top: ${TITLEBAR_HEIGHT}px !important;
       box-sizing: border-box !important;
-      background: #141414 !important;
+      background: var(--vkwave-bg, #141414) !important;
     }
     body::before {
       content: '';
@@ -173,12 +253,80 @@ function injectTitleBarStyles() {
       left: 0;
       right: 0;
       height: ${TITLEBAR_HEIGHT}px;
-      background: #141414;
+      background: var(--vkwave-bg, #141414);
       z-index: 2147483647;
       -webkit-app-region: drag;
     }
   `;
   mainWindow.webContents.insertCSS(css, { cssOrigin: 'user' }).catch(() => {});
+  applyMusicOnly();
+}
+
+/* -------------------- Режим «Только музыка» и темы ----------------------- */
+
+let redirectingToMusic = false;
+let musicOnlyCssKey = null;
+
+/** Скрываем всё, что не относится к музыке (селекторы-кандидаты; то, чего
+ * нет в текущем DOM ВК, просто не срабатывает). */
+const MUSIC_ONLY_CSS = `
+  #side_bar, #side_bar_inner, #left_menu, #left_nav,
+  [class*="leftMenu"], [class*="LeftMenu"], [id*="left_menu"],
+  [class*="AppPromo"], [class*="appPromo"], [class*="MobilePromo"],
+  [class*="promoBanner"], [class*="PromoBanner"],
+  #footer, .footer_bar
+  { display: none !important; }
+`;
+
+function enforceMusicOnly(url) {
+  if (!settings.musicOnly || redirectingToMusic) return;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_) {
+    return;
+  }
+  // Логин/OAuth/внешние хосты не трогаем — иначе сломаем авторизацию.
+  if (!/(^|\.)vk\.(com|ru)$/i.test(parsed.hostname)) return;
+  // Музыкальный раздел (включая альбомы и страницы артистов) — можно.
+  if (/^\/(music|artist|audio)/i.test(parsed.pathname)) return;
+  redirectingToMusic = true;
+  mainWindow.webContents
+    .loadURL(VK_MUSIC_URL)
+    .catch(() => {})
+    .then(() => {
+      redirectingToMusic = false;
+    });
+}
+
+function applyMusicOnly() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (settings.musicOnly && !musicOnlyCssKey) {
+    mainWindow.webContents
+      .insertCSS(MUSIC_ONLY_CSS, { cssOrigin: 'user' })
+      .then((key) => {
+        musicOnlyCssKey = key;
+      })
+      .catch(() => {});
+  } else if (!settings.musicOnly && musicOnlyCssKey) {
+    mainWindow.webContents.removeInsertedCSS(musicOnlyCssKey).catch(() => {});
+    musicOnlyCssKey = null;
+  }
+}
+
+/** Применяет main-часть настроек: цвет рамки, musicOnly, автозапуск. */
+function applySettingsToWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.setTitleBarOverlay({
+      color: settings.theme.background || '#141414',
+      symbolColor: isLightColor(settings.theme.background) ? '#1c1c1c' : '#ffffff'
+    });
+  } catch (_) {
+    /* titleBarOverlay доступен не на всех платформах */
+  }
+  applyMusicOnly();
+  applyAutoLaunch();
 }
 
 /* --------------------------------- Трей --------------------------------- */
@@ -218,6 +366,7 @@ function updateTray() {
         click: () => sendPlayerCommand('previous')
       },
       { type: 'separator' },
+      { label: 'Настройки', click: () => sendPlayerCommand('settings-toggle') },
       { label: 'Развернуть VK Wave', click: showMainWindow },
       { type: 'separator' },
       {
@@ -243,6 +392,9 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     app.setAppUserModelId('ru.vkwave.desktop');
 
+    loadSettings();
+    applyAutoLaunch();
+
     // Разрешаем только нужные странице разрешения (медиа, фулскрин, уведомления).
     const vkSession = session.fromPartition('persist:vkwave');
     vkSession.setPermissionRequestHandler((_wc, permission, callback) => {
@@ -262,6 +414,19 @@ if (!gotSingleInstanceLock) {
       lastTrack = track;
       if (discord) discord.update(track);
       updateTray();
+    });
+
+    // Настройки из панели VK Wave (Ctrl+Shift+T / трей).
+    ipcMain.handle('settings:get', () => settings);
+
+    ipcMain.handle('settings:set', (_event, patch) => {
+      settings = mergeSettings(settings, patch);
+      saveSettings();
+      applySettingsToWindow();
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('settings-updated', settings);
+      });
+      return settings;
     });
 
     createWindow();
