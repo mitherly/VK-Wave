@@ -4,14 +4,16 @@
  * VK Wave — интеграция Discord Rich Presence (@xhayper/discord-rpc).
  *
  *  • Details  — название трека, State — исполнитель.
- *  • Large Image — прямая ссылка на обложку (фолбэк — ассет «logo»).
- *  • Small Image — иконка play/pause с подписью «Воспроизводится»/«Пауза».
+ *  • Large Image — прямая ссылка на обложку (фолбэк — логотип из репозитория).
+ *  • Small Image — иконка play/pause (URL из репозитория) с подписью
+ *    «Воспроизводится»/«Пауза».
  *  • Timestamps — прогресс-бар трека (старт/конец), на паузе таймер убирается.
  *  • Buttons — «Слушать в VK Музыке» и «Скачать VK Wave (GitHub)».
  *  • Если клиент Discord не запущен — переподключение каждые 15 секунд.
  *
- * Ассеты «logo», «play», «pause» нужно один раз загрузить в приложение
- * на Discord Developer Portal (см. README → «Как настроить Discord Rich Presence»).
+ * Внешние URL в ассетах поддерживаются самим Discord RPC, поэтому
+ * дополнительная настройка портала не требуется. Загрузить арты в хранилище
+ * приложения (по желанию) можно скриптом tools/upload-discord-assets.js.
  */
 
 const { Client } = require('@xhayper/discord-rpc');
@@ -20,7 +22,12 @@ const { Client } = require('@xhayper/discord-rpc');
 const CLIENT_ID = '1565753930418233544';
 
 const RECONNECT_INTERVAL_MS = 15 * 1000;
-const LOGO_ASSET_KEY = 'logo';
+/* Discord RPC принимает внешние URL прямо в полях ассетов (официально
+ * подтверждено мейнтейнерами в discord-api-docs#6592) — поэтому иконки
+ * лежат в репозитории и работают без загрузки чего-либо в портал. */
+const LOGO_IMAGE_URL = 'https://raw.githubusercontent.com/mitherly/VK-Wave/main/assets/logo.png';
+const PLAY_IMAGE_URL = 'https://raw.githubusercontent.com/mitherly/VK-Wave/main/assets/play.png';
+const PAUSE_IMAGE_URL = 'https://raw.githubusercontent.com/mitherly/VK-Wave/main/assets/pause.png';
 const GITHUB_REPO_URL = 'https://github.com/mitherly/VK-Wave/releases/latest';
 
 const BUTTONS = [
@@ -50,9 +57,9 @@ function buildActivity(track) {
   const activity = {
     details: title,
     state: artist,
-    largeImageKey: track.coverUrl || LOGO_ASSET_KEY,
+    largeImageKey: track.coverUrl || LOGO_IMAGE_URL,
     largeImageText: `${title} — ${artist}`.slice(0, 128),
-    smallImageKey: track.isPlaying ? 'play' : 'pause',
+    smallImageKey: track.isPlaying ? PLAY_IMAGE_URL : PAUSE_IMAGE_URL,
     smallImageText: track.isPlaying ? 'Воспроизводится' : 'Пауза',
     instance: false,
     buttons: BUTTONS
