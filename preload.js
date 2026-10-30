@@ -328,6 +328,14 @@ function onTimeUpdate(event) {
   if (Number.isFinite(el.currentTime)) state.currentTime = el.currentTime;
   if (Number.isFinite(el.duration) && el.duration > 0 && el.duration !== Infinity) {
     state.duration = el.duration;
+  } else if (el.seekable && el.seekable.length > 0) {
+    // MSE-потоки ВК отдают duration = Infinity — реальная длина живёт в seekable.
+    try {
+      const seekableEnd = el.seekable.end(el.seekable.length - 1);
+      if (Number.isFinite(seekableEnd) && seekableEnd > 0) state.duration = seekableEnd;
+    } catch (_) {
+      /* seekable недоступен для этого источника */
+    }
   }
   maybeSend();
 }

@@ -14,12 +14,12 @@
  *  • Если клиент Discord не запущен — переподключение каждые 15 секунд.
  *
  * Картинки, максимально надёжно:
- *   если перед запуском задана переменная окружения DISCORD_BOT_TOKEN
- *   (токен бота ЭТОГО приложения), VK Wave сам зальёт logo/play/pause и
- *   обложку каждого трека в хранилище приложения и переключится на
- *   порталные ассеты — они рендерятся всегда, без проксирования внешних
- *   ссылок. Без токена используются прямые URL (официально поддержаны
- *   Discord, но прокси может капризничать).
+ *   заданы DISCORD_CLIENT_SECRET (+ опционально DISCORD_BOT_TOKEN) — VK Wave
+ *   получает Bearer-токен приложения (client_credentials) и грузит logo/play/pause
+ *   и обложку каждого трека в хранилище классическим телом {name, image} —
+ *   это самый надёжный маршрут. Запасной путь — двухшаговый presign-флоу с
+ *   токеном бота. Без секретов — прямые URL (официально поддержаны Discord,
+ *   но прокси может капризничать, а CDN ВК блокирует загрузки прокси Discord).
  *
  * Свежие версии @xhayper/discord-rpc не имеют setActivity/clearActivity —
  * работаем через протокольные client.request('SET_ACTIVITY'|'CLEAR_ACTIVITY').
@@ -32,6 +32,8 @@ const { Client } = require('@xhayper/discord-rpc');
 
 /** ← Application ID из Discord Developer Portal (см. README). */
 const CLIENT_ID = '1565753930418233544';
+
+const OAUTH_TOKEN_URL = 'https://discord.com/api/oauth2/token';
 
 /** ActivityType.LISTENING — в профиле будет «Слушает VK Wave». */
 const ACTIVITY_TYPE_LISTENING = 2;
@@ -77,13 +79,13 @@ function sha1Short(value) {
 }
 
 /* Недокументированный REST-эндпоинт ассетов приложения (v9). */
-async function apiRequest(method, url, token, body, rawAuth = false) {
+async function apiRequest(method, url, auth, body) {
   let response;
   try {
     response = await fetch(url, {
       method,
       headers: {
-        Authorization: rawAuth ? token : `Bot ${token}`,
+        Authorization: auth,
         ...(body ? { 'Content-Type': 'application/json' } : {})
       },
       body: body ? JSON.stringify(body) : undefined
@@ -113,6 +115,10 @@ function fileToImage(file) {
     contentType: 'image/png',
     ext: 'png'
   };
+}
+
+function bufferToDataUri(image) {
+  return `data:${image.contentType};base64,${image.buffer.toString('base64')}`;
 }
 
 async function fetchImage(url) {
@@ -222,7 +228,9 @@ class DiscordPresence {
 
     // Портальные ассеты: включаются, если задан DISCORD_BOT_TOKEN.
     this.botToken = (process.env.DISCORD_BOT_TOKEN || '').trim();
+    this.clientSecret = (process.env.DISCORD_CLIENT_SECRET || '').trim();
     this.portalKeysPromise = null;
+    this.appTokenCache = null; // { token, expiresAt } — client_credentials
     this.uploadedCoverNames = new Map(); // url → имя ассета в портале
 
     this.client.on('ready', () => {
@@ -252,10 +260,14 @@ class DiscordPresence {
       );
       return;
     }
+    if (this.clientSecret) {
+      log('DISCORD_CLIENT_SECRET задан — обложки и иконки пойдут через Bearer (client_credentials).');
+    }
     if (this.botToken) {
-      log('DISCORD_BOT_TOKEN задан — обложки и иконки будут заливаться в портал автоматически.');
-    } else {
-      log('DISCORD_BOT_TOKEN не задан — картинки идут внешними URL (см. README про «?» вместо обложки).');
+      log('DISCORD_BOT_TOKEN задан — запасной путь загрузки (presign-флоу).');
+    }
+    if (!this.clientSecret && !this.botToken) {
+      log('Секреты не заданы — картинки идут внешними URL (см. README про «?» вместо обложки).');
     }
     this.connect();
   }
@@ -286,44 +298,106 @@ class DiscordPresence {
     }, RECONNECT_INTERVAL_MS);
   }
 
+  /** Bearer-токен приложения через client_credentials (нужен CLIENT_SECRET). */
+  async ensureAppToken() {
+    if (!this.clientSecret) return null;
+    if (this.appTokenCache && Date.now() < this.appTokenCache.expiresAt) {
+      return this.appTokenCache.token;
+    }
+    try {
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: this.clientSecret,
+        grant_type: 'client_credentials',
+        scope: 'identify'
+      });
+      const response = await fetch(OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data || !data.access_token) {
+        throw new Error(
+          `HTTP ${response.status}: ${data && data.message ? data.message : 'нет access_token'}`
+        );
+      }
+      const expiresIn = Number(data.expires_in) || 604800;
+      this.appTokenCache = {
+        token: data.access_token,
+        expiresAt: Date.now() + Math.max(60, expiresIn - 60) * 1000
+      };
+      log('Получен Bearer-токен приложения (client_credentials).');
+      return this.appTokenCache.token;
+    } catch (err) {
+      log('client_credentials не удался:', errText(err));
+      return null;
+    }
+  }
+
   /** logo/play/pause → хранилище приложения (один раз за запуск). */
   async ensurePortalKeys() {
-    if (!this.botToken) return null;
+    if (!this.botToken && !this.clientSecret) return null;
     if (this.portalKeysPromise) return this.portalKeysPromise;
     this.portalKeysPromise = (async () => {
-      let existing = [];
-      try {
-        existing = await apiRequest('GET', ASSETS_API, this.botToken);
-      } catch (err) {
-        // На некоторых сборках Discord бот-токен принимается только без префикса.
+      const errors = [];
+
+      // Путь 1 — Bearer-токен приложения (client_credentials) и классическое
+      // тело {name, image}: маршрут владельца приложения, самый надёжный.
+      const appToken = await this.ensureAppToken();
+      if (appToken) {
         try {
-          existing = await apiRequest('GET', ASSETS_API, this.botToken, null, true);
-        } catch (_) {
-          log('Ассеты портала недоступны (использую внешние URL):', errText(err));
-          return null;
+          const existing = await apiRequest('GET', ASSETS_API, `Bearer ${appToken}`);
+          const names = new Set(existing.map((asset) => asset.name));
+          for (const key of ['logo', 'play', 'pause']) {
+            if (names.has(key)) continue;
+            const file = path.join(__dirname, 'assets', `${key}.png`);
+            if (!fs.existsSync(file)) continue;
+            await apiRequest('POST', ASSETS_API, `Bearer ${appToken}`, {
+              name: key,
+              image: bufferToDataUri(fileToImage(file))
+            });
+            await sleep(300);
+          }
+          log('Ассеты портала готовы (Bearer): logo, play, pause.');
+          return { logo: 'logo', play: 'play', pause: 'pause' };
+        } catch (err) {
+          errors.push(`Bearer: ${errText(err)}`);
         }
       }
-      try {
-        const names = new Set(existing.map((asset) => asset.name));
-        for (const key of ['logo', 'play', 'pause']) {
-          if (names.has(key)) continue;
-          const file = path.join(__dirname, 'assets', `${key}.png`);
-          if (!fs.existsSync(file)) continue;
-          await this.uploadAsset(key, fileToImage(file));
-          await sleep(300);
+
+      // Путь 2 — двухшаговый presign-флоу с токеном бота.
+      if (this.botToken) {
+        try {
+          let existing = [];
+          try {
+            existing = await apiRequest('GET', ASSETS_API, `Bot ${this.botToken}`);
+          } catch (_) {
+            existing = await apiRequest('GET', ASSETS_API, this.botToken); // без префикса
+          }
+          const names = new Set(existing.map((asset) => asset.name));
+          for (const key of ['logo', 'play', 'pause']) {
+            if (names.has(key)) continue;
+            const file = path.join(__dirname, 'assets', `${key}.png`);
+            if (!fs.existsSync(file)) continue;
+            await this.uploadAsset(key, fileToImage(file));
+            await sleep(300);
+          }
+          log('Ассеты портала готовы (presign): logo, play, pause.');
+          return { logo: 'logo', play: 'play', pause: 'pause' };
+        } catch (err) {
+          errors.push(`presign: ${errText(err)}`);
         }
-        log('Ассеты портала готовы: logo, play, pause.');
-        return { logo: 'logo', play: 'play', pause: 'pause' };
-      } catch (err) {
-        log('Загрузка ассетов в портал не удалась (использую внешние URL):', errText(err));
-        return null;
       }
+
+      log('Ассеты портала недоступны (использую внешние URL):', errors.join(' | ') || 'нет доступных путей');
+      return null;
     })();
     return this.portalKeysPromise;
   }
 
   /**
-   * Загрузка ассета в хранилище — актуальный двухшаговый флоу Discord:
+   * Загрузка ассета — запасной путь через presign-флоу Discord:
    *  1) POST /assets/upload → пресдейл-ссылка (upload_url + upload_filename);
    *  2) PUT байтов файла напрямую в GCP-бакет Discord;
    *  3) POST /assets с { key, uploaded_filename } — регистрация ассета.
@@ -332,7 +406,7 @@ class DiscordPresence {
     const filename = `${name}.${image.ext}`;
 
     // Шаг 1: пресдейл-ссылка.
-    const uploadResponse = await apiRequest('POST', `${ASSETS_API}/upload`, this.botToken, {
+    const uploadResponse = await apiRequest('POST', `${ASSETS_API}/upload`, `Bot ${this.botToken}`, {
       files: [{ filename, file_size: image.buffer.length }]
     });
     const attachments = uploadResponse && uploadResponse.attachments;
@@ -352,7 +426,7 @@ class DiscordPresence {
     }
 
     // Шаг 3: регистрируем ассет под ключом name.
-    return apiRequest('POST', ASSETS_API, this.botToken, {
+    return apiRequest('POST', ASSETS_API, `Bot ${this.botToken}`, {
       key: name,
       uploaded_filename: attachment.upload_filename
     });
@@ -360,21 +434,40 @@ class DiscordPresence {
 
   /** Обложка трека → ассет «cover_<hash>» в хранилище (дедуп по URL). */
   async uploadCoverAsAsset(url) {
-    if (!this.botToken || !url) return null;
+    if ((!this.botToken && !this.clientSecret) || !url) return null;
     if (this.uploadedCoverNames.has(url)) return this.uploadedCoverNames.get(url);
     try {
       const image = await fetchImage(url);
       if (!image) return null;
       const name = `cover_${sha1Short(url)}`;
-      await this.uploadAsset(name, image);
-      this.uploadedCoverNames.set(url, name);
-      // Кэш имён не должен расти бесконечно за долгую сессию.
-      if (this.uploadedCoverNames.size > 150) {
-        const oldest = this.uploadedCoverNames.keys().next().value;
-        this.uploadedCoverNames.delete(oldest);
+      const errors = [];
+
+      const appToken = await this.ensureAppToken();
+      if (appToken) {
+        try {
+          await apiRequest('POST', ASSETS_API, `Bearer ${appToken}`, {
+            name,
+            image: bufferToDataUri(image)
+          });
+          this.uploadedCoverNames.set(url, name);
+          return name;
+        } catch (err) {
+          errors.push(`Bearer: ${errText(err)}`);
+        }
       }
-      log('Обложка загружена в портал как', name);
-      return name;
+
+      if (this.botToken) {
+        try {
+          await this.uploadAsset(name, image);
+          this.uploadedCoverNames.set(url, name);
+          return name;
+        } catch (err) {
+          errors.push(`presign: ${errText(err)}`);
+        }
+      }
+
+      log('Обложка не загрузилась в портал (использую внешнюю ссылку):', errors.join(' | '));
+      return null;
     } catch (err) {
       log('Обложка не загрузилась в портал (использую внешнюю ссылку):', errText(err));
       return null;
