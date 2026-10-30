@@ -682,7 +682,11 @@ function mapVkuiToken(name) {
 function buildDeepThemeOverride() {
   const tokens = collectVkuiColorTokens();
   if (!tokens.length) return '';
-  const lines = [':root {'];
+  const lines = [
+    // VK объявляет токены на классах-обёртках темы — override только на :root
+    // проигрывает им. Объявляем на каждом элементе: наследование не перебьёт.
+    ':root, body, body * {'
+  ];
   for (const name of tokens) {
     const mapped = mapVkuiToken(name);
     if (mapped) lines.push(`  ${name}: ${mapped} !important;`);

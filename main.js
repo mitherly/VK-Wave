@@ -291,6 +291,7 @@ const MUSIC_ONLY_CSS = `
   [class*="leftMenu"], [class*="LeftMenu"], [id*="left_menu"],
   [class*="AppPromo"], [class*="appPromo"], [class*="MobilePromo"],
   [class*="promoBanner"], [class*="PromoBanner"],
+  [class*="promo" i], [class*="subscription" i],
   #footer, .footer_bar
   { display: none !important; }
 `;
