@@ -22,6 +22,14 @@ const path = require('path');
 
 const { DiscordPresence } = require('./discord');
 
+// VK душит нестандартные клиенты: строка Electron/x.y в User-Agent даёт
+// урезанные сценарии входа и чаще включает флуд-контроль («Слишком много
+// попыток, попробуйте позже»). Маскируемся под обычный Chrome той же версии.
+app.userAgentFallback = app.userAgentFallback
+  .replace(/\s*Electron\/[\d.]+/i, '')
+  .replace(/\s*VK Wave\/[\d.]+/i, '')
+  .trim();
+
 const VK_MUSIC_URL = 'https://vk.com/music';
 const WINDOW_TITLE = 'VK Wave';
 const TITLEBAR_HEIGHT = 34;
