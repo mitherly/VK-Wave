@@ -232,7 +232,12 @@ class DiscordPresence {
       .then(() => {
         if (!this.sentOnce) {
           this.sentOnce = true;
-          log('Присутствие отправлено. Если в профиле его не видно — см. «Возможные проблемы» в README.');
+          log(
+            'Присутствие отправлено. Обложка:',
+            activity.largeImageKey ? String(activity.largeImageKey).slice(0, 90) : 'нет',
+            '| Маленькая иконка:',
+            activity.smallImageKey ? String(activity.smallImageKey).slice(0, 70) : 'нет'
+          );
         }
       })
       .catch((err) => {

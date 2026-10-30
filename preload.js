@@ -609,8 +609,8 @@ const THEME_PRESETS = {
   light: { background: '#edeef0', cards: '#ffffff', accent: '#0077ff', radius: 16 }
 };
 
-/** Переопределение дизайн-токенов VKUI: так красится весь интерфейс ВК. */
-const VKUI_OVERRIDE_CSS = `
+/** Базовое переопределение (если скан токенов ВК ничего не нашёл). */
+const VKUI_FALLBACK_CSS = `
   :root {
     --vkui--color_background: var(--vkwave-bg) !important;
     --vkui--color_background_page: var(--vkwave-bg) !important;
@@ -629,13 +629,79 @@ const VKUI_OVERRIDE_CSS = `
 `;
 
 let themeStyleEl = null;
+let vkuiTokensScanned = false;
+
+function isLightBackground(hexColor) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hexColor || '');
+  if (!match) return false;
+  const int = parseInt(match[1], 16);
+  const r = (int >> 16) & 255;
+  const g = (int >> 8) & 255;
+  const b = int & 255;
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
+}
+
+/** Скан ВСЕХ цветовых дизайн-токенов VKUI из загруженных стилей ВК —
+ * так тема перекрашивает весь интерфейс, как это делают темы-расширения. */
+function collectVkuiColorTokens() {
+  const names = new Set();
+  for (const sheet of document.styleSheets) {
+    let rules;
+    try {
+      rules = sheet.cssRules;
+    } catch (_) {
+      continue; // кросс-доменный лист недоступен для чтения — пропускаем
+    }
+    for (const rule of rules) {
+      const style = rule && rule.style;
+      if (!style) continue;
+      for (let i = 0; i < style.length; i += 1) {
+        const prop = style[i];
+        if (typeof prop === 'string' && prop.startsWith('--vkui--color_')) {
+          names.add(prop);
+        }
+      }
+    }
+  }
+  return Array.from(names);
+}
+
+/** Категория токена → цвет палитры VK Wave. Семантические цвета
+ * (ошибки/предупреждения/успех) не трогаем — они должны оставаться красными/зелёными. */
+function mapVkuiToken(name) {
+  const n = name.toLowerCase();
+  if (/(_|)(negative|positive|warning)/.test(n)) return null;
+  if (n.includes('accent') || n.includes('text_link')) return 'var(--vkwave-accent)';
+  if (n.includes('background')) return 'var(--vkwave-cards)';
+  if (n.includes('text') || n.includes('icon')) return 'var(--vkwave-text)';
+  if (n.includes('stroke')) return 'var(--vkwave-stroke)';
+  if (n.includes('overlay')) return 'rgba(0, 0, 0, 0.55)';
+  return null;
+}
+
+function buildDeepThemeOverride() {
+  const tokens = collectVkuiColorTokens();
+  if (!tokens.length) return '';
+  const lines = [':root {'];
+  for (const name of tokens) {
+    const mapped = mapVkuiToken(name);
+    if (mapped) lines.push(`  ${name}: ${mapped} !important;`);
+  }
+  lines.push('}');
+  lines.push('body { background: var(--vkwave-bg) !important; }');
+  return lines.join('\n');
+}
 
 function applyTheme(s) {
   const t = (s && s.theme) || {};
+  const bg = t.background || '#141414';
+  const light = isLightBackground(bg);
   const root = document.documentElement;
-  root.style.setProperty('--vkwave-bg', t.background || '#141414');
+  root.style.setProperty('--vkwave-bg', bg);
   root.style.setProperty('--vkwave-cards', t.cards || '#1d1d22');
   root.style.setProperty('--vkwave-accent', t.accent || '#0077ff');
+  root.style.setProperty('--vkwave-text', light ? '#1d1d22' : '#e8eaf0');
+  root.style.setProperty('--vkwave-stroke', light ? 'rgba(0, 0, 0, 0.14)' : 'rgba(255, 255, 255, 0.14)');
   root.style.setProperty('--vkwave-radius', `${Number(t.radius) || 16}px`);
 
   if (!themeStyleEl || !themeStyleEl.isConnected) {
@@ -643,8 +709,22 @@ function applyTheme(s) {
     themeStyleEl.id = 'vkwave-theme';
     (document.head || document.documentElement).appendChild(themeStyleEl);
   }
-  // Пресет «default» = родная тёмная тема ВК, ничего не перекрашиваем.
-  themeStyleEl.textContent = t.preset && t.preset !== 'default' ? VKUI_OVERRIDE_CSS : '';
+  // Пресет «default» = родная тема ВК, ничего не перекрашиваем.
+  if (!t.preset || t.preset === 'default') {
+    themeStyleEl.textContent = '';
+    return;
+  }
+  themeStyleEl.textContent = buildDeepThemeOverride() || VKUI_FALLBACK_CSS;
+
+  // Стили ВК могли догрузиться после первого прохода — один раз пересканируем.
+  if (!vkuiTokensScanned) {
+    vkuiTokensScanned = true;
+    setTimeout(() => {
+      if (appSettings && appSettings.theme && appSettings.theme.preset !== 'default') {
+        applyTheme(appSettings);
+      }
+    }, 4000);
+  }
 }
 
 const PANEL_CSS = `
@@ -707,7 +787,7 @@ const PANEL_HTML = `
     <button id="vkwave-paste" class="vkwave-btn">Вставить</button>
     <button id="vkwave-reset" class="vkwave-btn vkwave-btn--ghost">Сброс</button>
   </div>
-  <div class="vkwave-panel__hint">Внешне ВК красится через VKUI-переменные: если отдельные элементы остались старого цвета — у ВК просто свои локальные токены, остальное перекрашивается.</div>
+  <div class="vkwave-panel__hint">Тема перекрашивает все цветовые токены VKUI в стилях ВК (текст, иконки, обводки — автоматически). Семантические цвета ошибок/успеха остаются родными.</div>
 `;
 
 function flashButton(panel, selector, text) {
