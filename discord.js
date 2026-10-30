@@ -115,10 +115,6 @@ function fileToImage(file) {
   };
 }
 
-function bufferToDataUri(image) {
-  return `data:${image.contentType};base64,${image.buffer.toString('base64')}`;
-}
-
 async function fetchImage(url) {
   try {
     const response = await fetch(url);
@@ -228,7 +224,6 @@ class DiscordPresence {
     this.botToken = (process.env.DISCORD_BOT_TOKEN || '').trim();
     this.portalKeysPromise = null;
     this.uploadedCoverNames = new Map(); // url → имя ассета в портале
-    this.uploadStrategy = 0;             // индекс рабочего формата загрузки
 
     this.client.on('ready', () => {
       this.connected = true;
@@ -328,83 +323,39 @@ class DiscordPresence {
   }
 
   /**
-   * Загрузка ассета в хранилище цепочкой форматов — Discord принимает
-   * их по-разному в зависимости от сборки: JSON с data URI → multipart
-   * с полем image (data URI) → multipart с файлом. Рабочий формат
-   * запоминается и используется для следующих загрузок.
+   * Загрузка ассета в хранилище — актуальный двухшаговый флоу Discord:
+   *  1) POST /assets/upload → пресдейл-ссылка (upload_url + upload_filename);
+   *  2) PUT байтов файла напрямую в GCP-бакет Discord;
+   *  3) POST /assets с { key, uploaded_filename } — регистрация ассета.
    */
   async uploadAsset(name, image) {
-    const dataUri = bufferToDataUri(image);
-    const strategies = [
-      {
-        label: 'JSON + data URI',
-        send: () =>
-          fetch(ASSETS_API, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bot ${this.botToken}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ name, image: dataUri })
-          })
-      },
-      {
-        label: 'multipart, image = data URI',
-        send: () => {
-          const form = new FormData();
-          form.append('name', name);
-          form.append('image', dataUri);
-          return fetch(ASSETS_API, {
-            method: 'POST',
-            headers: { Authorization: `Bot ${this.botToken}` },
-            body: form
-          });
-        }
-      },
-      {
-        label: 'multipart, image = файл',
-        send: () => {
-          const form = new FormData();
-          form.append('name', name);
-          form.append(
-            'image',
-            new Blob([image.buffer], { type: image.contentType }),
-            `${name}.${image.ext}`
-          );
-          return fetch(ASSETS_API, {
-            method: 'POST',
-            headers: { Authorization: `Bot ${this.botToken}` },
-            body: form
-          });
-        }
-      }
-    ];
+    const filename = `${name}.${image.ext}`;
 
-    let lastError = null;
-    for (let s = this.uploadStrategy; s < strategies.length; s += 1) {
-      let response;
-      try {
-        response = await strategies[s].send();
-      } catch (err) {
-        throw new Error(`Сеть недоступна (${errText(err)})`);
-      }
-      const raw = await response.text();
-      let payload = null;
-      try {
-        payload = raw ? JSON.parse(raw) : null;
-      } catch (_) {
-        payload = null;
-      }
-      if (response.ok) {
-        this.uploadStrategy = s;
-        return payload;
-      }
-      lastError = new Error(
-        `HTTP ${response.status}: ${payload && payload.message ? payload.message : raw.slice(0, 200)}`
-      );
-      if (response.status === 401 || response.status === 403) break; // токен — не тело виновато
+    // Шаг 1: пресдейл-ссылка.
+    const uploadResponse = await apiRequest('POST', `${ASSETS_API}/upload`, this.botToken, {
+      files: [{ filename, file_size: image.buffer.length }]
+    });
+    const attachments = uploadResponse && uploadResponse.attachments;
+    const attachment = Array.isArray(attachments) ? attachments[0] : null;
+    if (!attachment || !attachment.upload_url || !attachment.upload_filename) {
+      throw new Error('Discord не вернул upload_url для ассета');
     }
-    throw lastError || new Error('Все форматы загрузки отклонены');
+
+    // Шаг 2: байты файла — напрямую в хранилище Discord.
+    const putResponse = await fetch(attachment.upload_url, {
+      method: 'PUT',
+      headers: { 'Content-Type': image.contentType },
+      body: Buffer.from(image.buffer)
+    });
+    if (!putResponse.ok) {
+      throw new Error(`Загрузка файла в хранилище: HTTP ${putResponse.status}`);
+    }
+
+    // Шаг 3: регистрируем ассет под ключом name.
+    return apiRequest('POST', ASSETS_API, this.botToken, {
+      key: name,
+      uploaded_filename: attachment.upload_filename
+    });
   }
 
   /** Обложка трека → ассет «cover_<hash>» в хранилище (дедуп по URL). */
