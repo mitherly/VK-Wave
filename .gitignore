@@ -1,0 +1,15 @@
+# Зависимости
+node_modules/
+
+# Сборка
+dist/
+
+# Логи
+*.log
+npm-debug.log*
+
+# Служебные файлы ОС и редакторов
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
