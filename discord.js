@@ -162,4 +162,4 @@ class DiscordPresence {
   }
 }
 
-module.exports = { DiscordPresence, buildActivity };
+module.exports = { CLIENT_ID, DiscordPresence, buildActivity };

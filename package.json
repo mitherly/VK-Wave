@@ -34,7 +34,8 @@
     "start": "electron .",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win",
-    "dist:portable": "electron-builder --win portable"
+    "dist:portable": "electron-builder --win portable",
+    "upload:assets": "node tools/upload-discord-assets.js"
   },
   "dependencies": {
     "@xhayper/discord-rpc": "^1.5.1"
