@@ -218,22 +218,29 @@ function toRawActivity(activity, listening) {
 
 class DiscordPresence {
   constructor() {
-    this.client = new Client({ clientId: CLIENT_ID });
+    // Секрет обязателен в КОНСТРУКТОРЕ — только так библиотека сможет
+    // обменять код авторизации на Bearer-токен владельца.
+    const clientSecret = (process.env.DISCORD_CLIENT_SECRET || '').trim();
+    this.client = new Client({
+      clientId: CLIENT_ID,
+      ...(clientSecret ? { clientSecret } : {})
+    });
     this.connected = false;
     this.connecting = false;
     this.reconnectTimer = null;
     this.lastTrack = null;
     this.sentOnce = false;      // успешная отправка уже логировалась
     this.loggedLoginError = false;
+    this.degraded = false;      // Discord не принял маленькую иконку — шлём без неё
 
-    // Портальные ассеты: включаются, если задан DISCORD_BOT_TOKEN.
     this.botToken = (process.env.DISCORD_BOT_TOKEN || '').trim();
-    this.clientSecret = (process.env.DISCORD_CLIENT_SECRET || '').trim();
+    this.clientSecret = clientSecret;
     this.portalKeysPromise = null;
     this.appTokenCache = null;      // { token, expiresAt } — client_credentials
     this.rpcUserToken = null;       // Bearer-токен владельца (авторизация в Discord)
     this.triedConsentPrompt = false;
     this.uploadedCoverNames = new Map(); // url → имя ассета в портале
+    this.lastReconnectReason = null;
 
     this.client.on('ready', () => {
       this.connected = true;
@@ -283,7 +290,6 @@ class DiscordPresence {
       // Авторизация владельца через Discord-клиент: даёт Bearer-токен для
       // загрузки ассетов. Повторные запуски проходят молча (prompt: none),
       // при первой авторизации Discord покажет окно «Разрешить».
-      loginOptions.clientSecret = this.clientSecret;
       loginOptions.scopes = ['rpc'];
       if (!this.triedConsentPrompt) loginOptions.prompt = 'none';
     }
@@ -297,23 +303,21 @@ class DiscordPresence {
       if (this.clientSecret && !this.triedConsentPrompt) {
         this.triedConsentPrompt = true;
         log(
-          'Тихая авторизация недоступна. В Discord появится окно «VK Wave запрашивает доступ» — нажми «Разрешить».',
-          `(${errText(err)})`
+          'Тихая авторизация недоступна. В Discord появится окно «VK Wave запрашивает доступ» — нажми «Разрешить».'
         );
         return this.connect();
       }
-      if (!this.loggedLoginError) {
-        this.loggedLoginError = true;
-        log('Подключение не удалось:', errText(err));
-      }
-      this.scheduleReconnect('Клиент Discord не запущен или недоступен');
+      this.scheduleReconnect(errText(err));
     }
   }
 
-  /** Повтор подключения каждые 15 секунд, пока Discord не поднимется. */
+  /** Повтор подключения каждые 15 секунд. Одинаковые причины не спамим. */
   scheduleReconnect(reason) {
     if (this.reconnectTimer) return;
-    if (reason) log(`${reason} — повторная попытка через 15 секунд.`);
+    if (reason && reason !== this.lastReconnectReason) {
+      log(`${reason} — повторная попытка через 15 секунд.`);
+      this.lastReconnectReason = reason;
+    }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
