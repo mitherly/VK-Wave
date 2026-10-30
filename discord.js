@@ -136,11 +136,22 @@ function buildActivity(track, images) {
   const title = track.title || 'Неизвестный трек';
   const artist = track.artist || 'VK Музыка';
 
+  /** «0:33 / 2:15» — нижняя строка карточки. */
+  const formatTime = (seconds) => {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const minutes = Math.floor(total / 60);
+    const secs = String(total % 60).padStart(2, '0');
+    return `${minutes}:${secs}`;
+  };
+  const hasDuration = Number.isFinite(track.duration) && track.duration > 0;
+
   const activity = {
     details: title,
     state: artist,
     largeImageKey: (images && images.large) || LOGO_IMAGE_URL,
-    largeImageText: `${title} — ${artist}`.slice(0, 128),
+    largeImageText: hasDuration
+      ? `${formatTime(track.currentTime)} / ${formatTime(track.duration)}`
+      : `${title} — ${artist}`.slice(0, 128),
     smallImageKey: (images && images.small) || (track.isPlaying ? PLAY_IMAGE_URL : PAUSE_IMAGE_URL),
     smallImageText: track.isPlaying ? 'Воспроизводится' : 'Пауза',
     instance: false,

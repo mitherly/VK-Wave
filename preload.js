@@ -987,6 +987,14 @@ function init() {
 
   runExtraction();
   setInterval(runExtraction, POLL_INTERVAL_MS);
+
+  // Живая строка «0:33 / 2:15» в Discord: раз в 5 секунд обновляем время,
+  // пока играет. Между обновлениями нативный таймер Discord тикает сам.
+  setInterval(() => {
+    if (state.isPlaying && state.duration > 0 && state.title) {
+      sendTrackUpdate(Date.now(), buildPayload());
+    }
+  }, 5000);
 }
 
 if (document.readyState === 'loading') {
