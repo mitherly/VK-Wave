@@ -77,13 +77,13 @@ function sha1Short(value) {
 }
 
 /* Недокументированный REST-эндпоинт ассетов приложения (v9). */
-async function apiRequest(method, url, token, body) {
+async function apiRequest(method, url, token, body, rawAuth = false) {
   let response;
   try {
     response = await fetch(url, {
       method,
       headers: {
-        Authorization: `Bot ${token}`,
+        Authorization: rawAuth ? token : `Bot ${token}`,
         ...(body ? { 'Content-Type': 'application/json' } : {})
       },
       body: body ? JSON.stringify(body) : undefined
@@ -107,15 +107,19 @@ async function apiRequest(method, url, token, body) {
   return payload || [];
 }
 
-function fileToDataUri(filePath) {
-  const data = fs.readFileSync(filePath);
-  if (data.length > 8 * 1024 * 1024) {
-    throw new Error(`${path.basename(filePath)} больше 8 МБ`);
-  }
-  return `data:image/png;base64,${data.toString('base64')}`;
+function fileToImage(file) {
+  return {
+    buffer: fs.readFileSync(file),
+    contentType: 'image/png',
+    ext: 'png'
+  };
 }
 
-async function fetchImageAsDataUri(url) {
+function bufferToDataUri(image) {
+  return `data:${image.contentType};base64,${image.buffer.toString('base64')}`;
+}
+
+async function fetchImage(url) {
   try {
     const response = await fetch(url);
     if (!response.ok) return null;
@@ -123,7 +127,14 @@ async function fetchImageAsDataUri(url) {
     if (!contentType.startsWith('image/')) return null;
     const buffer = Buffer.from(await response.arrayBuffer());
     if (buffer.length === 0 || buffer.length > 8 * 1024 * 1024) return null;
-    return `data:${contentType};base64,${buffer.toString('base64')}`;
+    const ext = contentType.includes('png')
+      ? 'png'
+      : contentType.includes('gif')
+        ? 'gif'
+        : contentType.includes('webp')
+          ? 'webp'
+          : 'jpg';
+    return { buffer, contentType, ext };
   } catch (_) {
     return null;
   }
@@ -217,6 +228,7 @@ class DiscordPresence {
     this.botToken = (process.env.DISCORD_BOT_TOKEN || '').trim();
     this.portalKeysPromise = null;
     this.uploadedCoverNames = new Map(); // url → имя ассета в портале
+    this.uploadStrategy = 0;             // индекс рабочего формата загрузки
 
     this.client.on('ready', () => {
       this.connected = true;
@@ -284,27 +296,115 @@ class DiscordPresence {
     if (!this.botToken) return null;
     if (this.portalKeysPromise) return this.portalKeysPromise;
     this.portalKeysPromise = (async () => {
+      let existing = [];
       try {
-        const existing = await apiRequest('GET', ASSETS_API, this.botToken);
+        existing = await apiRequest('GET', ASSETS_API, this.botToken);
+      } catch (err) {
+        // На некоторых сборках Discord бот-токен принимается только без префикса.
+        try {
+          existing = await apiRequest('GET', ASSETS_API, this.botToken, null, true);
+        } catch (_) {
+          log('Ассеты портала недоступны (использую внешние URL):', errText(err));
+          return null;
+        }
+      }
+      try {
         const names = new Set(existing.map((asset) => asset.name));
         for (const key of ['logo', 'play', 'pause']) {
           if (names.has(key)) continue;
           const file = path.join(__dirname, 'assets', `${key}.png`);
           if (!fs.existsSync(file)) continue;
-          await apiRequest('POST', ASSETS_API, this.botToken, {
-            name: key,
-            image: fileToDataUri(file)
-          });
+          await this.uploadAsset(key, fileToImage(file));
           await sleep(300);
         }
         log('Ассеты портала готовы: logo, play, pause.');
         return { logo: 'logo', play: 'play', pause: 'pause' };
       } catch (err) {
-        log('Ассеты портала недоступны (использую внешние URL):', errText(err));
+        log('Загрузка ассетов в портал не удалась (использую внешние URL):', errText(err));
         return null;
       }
     })();
     return this.portalKeysPromise;
+  }
+
+  /**
+   * Загрузка ассета в хранилище цепочкой форматов — Discord принимает
+   * их по-разному в зависимости от сборки: JSON с data URI → multipart
+   * с полем image (data URI) → multipart с файлом. Рабочий формат
+   * запоминается и используется для следующих загрузок.
+   */
+  async uploadAsset(name, image) {
+    const dataUri = bufferToDataUri(image);
+    const strategies = [
+      {
+        label: 'JSON + data URI',
+        send: () =>
+          fetch(ASSETS_API, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bot ${this.botToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ name, image: dataUri })
+          })
+      },
+      {
+        label: 'multipart, image = data URI',
+        send: () => {
+          const form = new FormData();
+          form.append('name', name);
+          form.append('image', dataUri);
+          return fetch(ASSETS_API, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${this.botToken}` },
+            body: form
+          });
+        }
+      },
+      {
+        label: 'multipart, image = файл',
+        send: () => {
+          const form = new FormData();
+          form.append('name', name);
+          form.append(
+            'image',
+            new Blob([image.buffer], { type: image.contentType }),
+            `${name}.${image.ext}`
+          );
+          return fetch(ASSETS_API, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${this.botToken}` },
+            body: form
+          });
+        }
+      }
+    ];
+
+    let lastError = null;
+    for (let s = this.uploadStrategy; s < strategies.length; s += 1) {
+      let response;
+      try {
+        response = await strategies[s].send();
+      } catch (err) {
+        throw new Error(`Сеть недоступна (${errText(err)})`);
+      }
+      const raw = await response.text();
+      let payload = null;
+      try {
+        payload = raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        payload = null;
+      }
+      if (response.ok) {
+        this.uploadStrategy = s;
+        return payload;
+      }
+      lastError = new Error(
+        `HTTP ${response.status}: ${payload && payload.message ? payload.message : raw.slice(0, 200)}`
+      );
+      if (response.status === 401 || response.status === 403) break; // токен — не тело виновато
+    }
+    throw lastError || new Error('Все форматы загрузки отклонены');
   }
 
   /** Обложка трека → ассет «cover_<hash>» в хранилище (дедуп по URL). */
@@ -312,10 +412,10 @@ class DiscordPresence {
     if (!this.botToken || !url) return null;
     if (this.uploadedCoverNames.has(url)) return this.uploadedCoverNames.get(url);
     try {
-      const name = `cover_${sha1Short(url)}`;
-      const image = await fetchImageAsDataUri(url);
+      const image = await fetchImage(url);
       if (!image) return null;
-      await apiRequest('POST', ASSETS_API, this.botToken, { name, image });
+      const name = `cover_${sha1Short(url)}`;
+      await this.uploadAsset(name, image);
       this.uploadedCoverNames.set(url, name);
       // Кэш имён не должен расти бесконечно за долгую сессию.
       if (this.uploadedCoverNames.size > 150) {
