@@ -38,8 +38,9 @@ const DEFAULT_SETTINGS = {
   hotkeys: true,     // Space — пауза, Ctrl+←/→ — треки
   autoLaunch: false, // запускать с Windows
   startInTray: false, // стартовать свёрнутым в трей
+  trayCover: true,   // иконка трея = обложка текущего трека
   theme: {
-    preset: 'default', // default | oled | midnight | light | custom
+    preset: 'default', // default | oled | midnight | light | sakura | emerald | lavender | amber | custom
     background: '#141414',
     cards: '#1d1d22',
     accent: '#0077ff',
@@ -111,6 +112,8 @@ let tray = null;
 let discord = null;
 let isQuitting = false;
 let lastTrack = null;
+let defaultTrayIcon = null;           // родная иконка приложения для трея
+const trayCoverCache = new Map();     // url обложки → nativeImage 16×16
 
 /* ---------------------------- Вспомогательное ---------------------------- */
 
@@ -343,6 +346,7 @@ function applySettingsToWindow() {
   } catch (_) {
     /* titleBarOverlay доступен не на всех платформах */
   }
+  if (!settings.trayCover) resetTrayIcon();
   applyMusicOnly();
   applyAutoLaunch();
 }
@@ -353,10 +357,43 @@ function createTray() {
   const icon = nativeImage
     .createFromPath(path.join(__dirname, 'assets', 'logo.png'))
     .resize({ width: 16, height: 16 });
+  defaultTrayIcon = icon;
   tray = new Tray(icon);
   tray.setToolTip(WINDOW_TITLE);
   tray.on('click', () => showMainWindow());
   updateTray();
+}
+
+/** Иконка трея = обложка текущего трека (если включено в настройках). */
+async function updateTrayIcon(track) {
+  if (!tray) return;
+  if (!settings.trayCover || !track || !track.coverUrl) return;
+  const url = track.coverUrl;
+  if (trayCoverCache.has(url)) {
+    tray.setImage(trayCoverCache.get(url));
+    return;
+  }
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return;
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return;
+    const image = nativeImage.createFromBuffer(Buffer.from(await response.arrayBuffer()));
+    if (image.isEmpty()) return;
+    const trayImage = image.resize({ width: 16, height: 16 });
+    trayCoverCache.set(url, trayImage);
+    if (trayCoverCache.size > 30) {
+      const oldest = trayCoverCache.keys().next().value;
+      trayCoverCache.delete(oldest);
+    }
+    tray.setImage(trayImage);
+  } catch (_) {
+    /* обложка не скачалась — оставляем прошлую иконку */
+  }
+}
+
+function resetTrayIcon() {
+  if (tray && defaultTrayIcon) tray.setImage(defaultTrayIcon);
 }
 
 function updateTray() {
@@ -439,6 +476,7 @@ if (!gotSingleInstanceLock) {
         }
       }
       updateTray();
+      updateTrayIcon(track).catch(() => {});
     });
 
     // Настройки из панели VK Wave (Ctrl+Shift+T / трей).

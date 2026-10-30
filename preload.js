@@ -347,6 +347,7 @@ function setupMediaElementListeners() {
   document.addEventListener('timeupdate', onTimeUpdate, true);
   document.addEventListener('seeked', onTimeUpdate, true);
   document.addEventListener('loadedmetadata', onTimeUpdate, true);
+  document.addEventListener('durationchange', onTimeUpdate, true);
 }
 
 /* ----------------------- Извлечение данных о треке ----------------------- */
@@ -614,7 +615,11 @@ const THEME_PRESETS = {
   default: { background: '#141414', cards: '#1d1d22', accent: '#0077ff', radius: 16 },
   oled: { background: '#000000', cards: '#101014', accent: '#0077ff', radius: 14 },
   midnight: { background: '#0e1322', cards: '#172033', accent: '#5b8cff', radius: 18 },
-  light: { background: '#edeef0', cards: '#ffffff', accent: '#0077ff', radius: 16 }
+  light: { background: '#edeef0', cards: '#ffffff', accent: '#0077ff', radius: 16 },
+  sakura: { background: '#201622', cards: '#2b1f30', accent: '#ff7eb6', radius: 20 },
+  emerald: { background: '#0d1a13', cards: '#142520', accent: '#2ecc8f', radius: 16 },
+  lavender: { background: '#171225', cards: '#221b33', accent: '#a78bfa', radius: 18 },
+  amber: { background: '#1f1810', cards: '#2b2318', accent: '#ffb14a', radius: 16 }
 };
 
 /** Базовое переопределение (если скан токенов ВК ничего не нашёл). */
@@ -782,6 +787,10 @@ const PANEL_HTML = `
     <button data-preset="oled" class="vkwave-chip">OLED</button>
     <button data-preset="midnight" class="vkwave-chip">Midnight</button>
     <button data-preset="light" class="vkwave-chip">Light</button>
+    <button data-preset="sakura" class="vkwave-chip">🌸 Сакура</button>
+    <button data-preset="emerald" class="vkwave-chip">💚 Изумруд</button>
+    <button data-preset="lavender" class="vkwave-chip">💜 Лаванда</button>
+    <button data-preset="amber" class="vkwave-chip">🧡 Янтарная</button>
   </div>
   <label class="vkwave-row">Фон окна <input type="color" id="vkwave-bg-input"></label>
   <label class="vkwave-row">Карточки <input type="color" id="vkwave-cards-input"></label>
@@ -790,6 +799,7 @@ const PANEL_HTML = `
 
   <div class="vkwave-panel__section">Поведение</div>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-musiconly"> Только музыка</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-traycover"> Обложка в трее</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-hotkeys"> Хоткеи (Space, Ctrl+←/→)</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autolaunch"> Запускать с Windows</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-startintray"> Стартовать в трее</label>
@@ -833,6 +843,7 @@ function syncPanel(s) {
     if (el) el.checked = !!value;
   };
   setChecked('vkwave-musiconly', s.musicOnly);
+  setChecked('vkwave-traycover', s.trayCover);
   setChecked('vkwave-hotkeys', s.hotkeys);
   setChecked('vkwave-autolaunch', s.autoLaunch);
   setChecked('vkwave-startintray', s.startInTray);
@@ -881,6 +892,7 @@ function buildPanel() {
     el.addEventListener('change', () => sendSettings({ [key]: el.checked }));
   };
   bindCheckbox('vkwave-musiconly', 'musicOnly');
+  bindCheckbox('vkwave-traycover', 'trayCover');
   bindCheckbox('vkwave-hotkeys', 'hotkeys');
   bindCheckbox('vkwave-autolaunch', 'autoLaunch');
   bindCheckbox('vkwave-startintray', 'startInTray');

@@ -1,7 +1,7 @@
 {
   "name": "vk-wave",
   "productName": "VK Wave",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Десктопный клиент VK Музыки с Discord Rich Presence, медиа-клавишами и системным треем",
   "main": "main.js",
   "author": {
