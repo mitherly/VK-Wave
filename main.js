@@ -161,12 +161,17 @@ function createWindow() {
     backgroundColor: '#141414',
     autoHideMenuBar: true,
     icon: path.join(__dirname, 'assets', 'logo.png'),
-    titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#141414',
-      symbolColor: '#ffffff',
-      height: TITLEBAR_HEIGHT
-    },
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    // Overlay-кнопки окна: Windows и Linux. На macOS — нативные traffic lights.
+    ...(process.platform !== 'darwin'
+      ? {
+          titleBarOverlay: {
+            color: '#141414',
+            symbolColor: '#ffffff',
+            height: TITLEBAR_HEIGHT
+          }
+        }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition: 'persist:vkwave',
