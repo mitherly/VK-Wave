@@ -21,7 +21,7 @@ const CLIENT_ID = '1565753930418233544';
 
 const RECONNECT_INTERVAL_MS = 15 * 1000;
 const LOGO_ASSET_KEY = 'logo';
-const GITHUB_REPO_URL = 'https://github.com/mitherly/VK-Wave';
+const GITHUB_REPO_URL = 'https://github.com/mitherly/VK-Wave/releases/latest';
 
 const BUTTONS = [
   {
