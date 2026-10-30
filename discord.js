@@ -13,13 +13,12 @@
  *  • Buttons — «Слушать в VK Музыке» и «Скачать VK Wave (GitHub)».
  *  • Если клиент Discord не запущен — переподключение каждые 15 секунд.
  *
- * Картинки, максимально надёжно:
- *   заданы DISCORD_CLIENT_SECRET (+ опционально DISCORD_BOT_TOKEN) — VK Wave
- *   получает Bearer-токен приложения (client_credentials) и грузит logo/play/pause
- *   и обложку каждого трека в хранилище классическим телом {name, image} —
- *   это самый надёжный маршрут. Запасной путь — двухшаговый presign-флоу с
- *   токеном бота. Без секретов — прямые URL (официально поддержаны Discord,
- *   но прокси может капризничать, а CDN ВК блокирует загрузки прокси Discord).
+ * Картинки — через ключи хранилища приложения (рендерятся всегда):
+ *   1. Один раз залить logo/play/pause в портал (Rich Presence → Art Assets),
+ *      либо задать DISCORD_CLIENT_SECRET — приложение зальёт их само.
+ *   2. Обложка трека грузится динамически тем же способом, если задан
+ *      DISCORD_CLIENT_SECRET (Bearer владельца / client_credentials / presign).
+ *   3. Без ассетов карточка остаётся текстовой (без «?» вместо картинок).
  *
  * Свежие версии @xhayper/discord-rpc не имеют setActivity/clearActivity —
  * работаем через протокольные client.request('SET_ACTIVITY'|'CLEAR_ACTIVITY').
@@ -42,12 +41,13 @@ const RECONNECT_INTERVAL_MS = 15 * 1000;
 const GITHUB_REPO_URL = 'https://github.com/mitherly/VK-Wave/releases/latest';
 const ASSETS_API = `https://discord.com/api/v9/applications/${CLIENT_ID}/assets`;
 
-/* Discord RPC принимает внешние URL прямо в полях ассетов (официально
- * подтверждено мейнтейнерами в discord-api-docs#6592) — иконки лежат в
- * репозитории и работают без загрузки чего-либо в портал. */
-const LOGO_IMAGE_URL = 'https://raw.githubusercontent.com/mitherly/VK-Wave/main/assets/logo.png';
-const PLAY_IMAGE_URL = 'https://raw.githubusercontent.com/mitherly/VK-Wave/main/assets/play.png';
-const PAUSE_IMAGE_URL = 'https://raw.githubusercontent.com/mitherly/VK-Wave/main/assets/pause.png';
+/* Ассеты Rich Presence — ключи из хранилища приложения. Их нужно один раз
+ * залить в портал (Rich Presence → Art Assets): logo, play, pause — и они
+ * рендерятся в карточке всегда. Обложка трека — динамически через автоматическую
+ * загрузку (DISCORD_CLIENT_SECRET), либо её не будет вовсе (чисто и без «?»). */
+const LOGO_ASSET_KEY = 'logo';
+const PLAY_ASSET_KEY = 'play';
+const PAUSE_ASSET_KEY = 'pause';
 
 const BUTTONS = [
   {
@@ -161,11 +161,12 @@ function buildActivity(track, images) {
   const activity = {
     details: title,
     state: artist,
-    largeImageKey: (images && images.large) || LOGO_IMAGE_URL,
+    largeImageKey: (images && images.large) || LOGO_ASSET_KEY,
     largeImageText: hasDuration
       ? `${formatTime(track.currentTime)} / ${formatTime(track.duration)}`
       : `${title} — ${artist}`.slice(0, 128),
-    smallImageKey: (images && images.small) || (track.isPlaying ? PLAY_IMAGE_URL : PAUSE_IMAGE_URL),
+    smallImageKey:
+      (images && images.small) || (track.isPlaying ? PLAY_ASSET_KEY : PAUSE_ASSET_KEY),
     smallImageText: track.isPlaying ? 'Воспроизводится' : 'Пауза',
     instance: false,
     buttons: BUTTONS
@@ -270,13 +271,9 @@ class DiscordPresence {
       return;
     }
     if (this.clientSecret) {
-      log('DISCORD_CLIENT_SECRET задан — обложки и иконки пойдут через Bearer (client_credentials).');
-    }
-    if (this.botToken) {
-      log('DISCORD_BOT_TOKEN задан — запасной путь загрузки (presign-флоу).');
-    }
-    if (!this.clientSecret && !this.botToken) {
-      log('Секреты не заданы — картинки идут внешними URL (см. README про «?» вместо обложки).');
+      log('DISCORD_CLIENT_SECRET задан — обложки будут заливаться автоматически.');
+    } else {
+      log('Ассеты-ключи: logo, play, pause (загрузи один раз в портал — см. README).');
     }
     this.connect();
   }
@@ -552,16 +549,17 @@ class DiscordPresence {
     }
   }
 
-  /** Решает, какими ключами показывать картинки. */
+  /** Решает, какими ключами показывать картинки: порталные ключи
+   * logo/play/pause + обложка (если авто-загрузка удалась). */
   async resolveImages(track) {
     const images = {
-      large: track.coverUrl || null,
-      small: track.isPlaying ? PLAY_IMAGE_URL : PAUSE_IMAGE_URL
+      large: LOGO_ASSET_KEY,
+      small: track.isPlaying ? PLAY_ASSET_KEY : PAUSE_ASSET_KEY
     };
     const portal = await this.ensurePortalKeys();
     if (portal) {
       images.small = track.isPlaying ? portal.play : portal.pause;
-      if (!images.large) images.large = portal.logo;
+      images.large = portal.logo;
     }
     const coverKey = await this.uploadCoverAsAsset(track.coverUrl);
     if (coverKey) images.large = coverKey;

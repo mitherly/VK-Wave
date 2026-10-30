@@ -99,28 +99,12 @@ npm start
    const CLIENT_ID = 'ВАШ_APPLICATION_ID';
    ```
 
-5. Иконки и логотип **работают сразу** — discord.js передаёт их в Discord внешними URL из репозитория (это официально поддерживается Rich Presence). Загрузка ассетов в портал **не требуется**.
+5. **Загрузите три файла в портал (2 минуты, один раз):** вкладка **Rich Presence → Art Assets** → *Add Asset*:
+   - `assets/logo.png` → ключ `logo`
+   - `assets/play.png` → ключ `play`
+   - `assets/pause.png` → ключ `pause`
 
-   Хотите видеть арты в хранилище своего приложения (Rich Presence → Art Assets)? Два способа:
-
-   **Скриптом:** возьмите токен бота (вкладка **Bot** → *Reset Token*) и выполните:
-
-   ```bash
-   # Windows (cmd)
-   set DISCORD_BOT_TOKEN=ваш_токен && npm run upload:assets
-
-   # PowerShell
-   $env:DISCORD_BOT_TOKEN="ваш_токен"; npm run upload:assets
-
-   # Linux/macOS
-   DISCORD_BOT_TOKEN=ваш_токен npm run upload:assets
-   ```
-
-   Скрипт зальёт `logo`, `play`, `pause`; повторный запуск безопасен. ⚠️ Токен нигде не публикуйте и не коммитьте.
-
-   **Или вручную:** вкладка **Rich Presence → Art Assets** → загрузите `assets/logo.png`, `assets/play.png`, `assets/pause.png` под соответствующими ключами.
-
-   > Обложка текущего трека подхватывается автоматически — прямой ссылкой, загружать её не нужно.
+   Без них карточка будет без картинок — но текст, время и кнопки работают всегда.
 6. Перезапустите VK Wave. **Клиент Discord должен быть запущен.**
 
 Готово — откройте свой профиль в Discord и наслаждайтесь видом 🎶
