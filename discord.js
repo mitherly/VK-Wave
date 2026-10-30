@@ -84,6 +84,39 @@ function buildActivity(track) {
   return activity;
 }
 
+/** Плоский объект активности → вложенный формат IPC-команды SET_ACTIVITY. */
+function toRawActivity(activity) {
+  const raw = {
+    details: activity.details,
+    state: activity.state,
+    timestamps: {},
+    assets: {},
+    instance: activity.instance === true
+  };
+  if (Number.isFinite(activity.startTimestamp)) {
+    raw.timestamps.start = Math.round(activity.startTimestamp);
+  }
+  if (Number.isFinite(activity.endTimestamp)) {
+    raw.timestamps.end = Math.round(activity.endTimestamp);
+  }
+  if (activity.largeImageKey) {
+    raw.assets.large_image = activity.largeImageKey;
+    if (activity.largeImageText) raw.assets.large_text = activity.largeImageText;
+  }
+  if (activity.smallImageKey) {
+    raw.assets.small_image = activity.smallImageKey;
+    if (activity.smallImageText) raw.assets.small_text = activity.smallImageText;
+  }
+  if (Array.isArray(activity.buttons) && activity.buttons.length > 0) {
+    raw.buttons = activity.buttons;
+  }
+  return raw;
+}
+
+function errText(err) {
+  return err && err.message ? err.message : String(err);
+}
+
 class DiscordPresence {
   constructor() {
     this.client = new Client({ clientId: CLIENT_ID });
@@ -156,19 +189,46 @@ class DiscordPresence {
     if (!this.connected || isClientIdMissing) return;
     const activity = buildActivity(track);
     if (!activity) return;
-    this.sendActivity(activity);
+    try {
+      this.sendActivity(activity);
+    } catch (err) {
+      log('Ошибка при отправке присутствия:', errText(err));
+    }
   }
 
-  /** Отправка присутствия с самолечением: если Discord отверг маленькую
-   * иконку (внешние URL принимают не все сборки), повторяем без неё. */
+  /**
+   * Отправка присутствия через протокольную команду SET_ACTIVITY
+   * (в свежих версиях @xhayper/discord-rpc нет setActivity/clearActivity —
+   * только низкоуровневый client.request). С самолечением: если Discord
+   * отверг маленькую иконку (внешние URL принимают не все сборки),
+   * повторяем без неё.
+   */
   sendActivity(activity) {
-    if (this.degraded && activity.smallImageKey) {
-      delete activity.smallImageKey;
-      delete activity.smallImageText;
+    const attempt = (withSmallImage) => {
+      const flat = withSmallImage ? activity : { ...activity };
+      if (!withSmallImage) {
+        delete flat.smallImageKey;
+        delete flat.smallImageText;
+      }
+      return this.client.request('SET_ACTIVITY', {
+        pid: process.pid,
+        activity: toRawActivity(flat)
+      });
+    };
+
+    if (this.degraded) {
+      attempt(false)
+        .then(() => {
+          if (!this.sentOnce) {
+            this.sentOnce = true;
+            log('Присутствие отправлено (без маленькой иконки).');
+          }
+        })
+        .catch((err) => log('Не удалось обновить присутствие:', errText(err)));
+      return;
     }
 
-    this.client
-      .setActivity(activity)
+    attempt(true)
       .then(() => {
         if (!this.sentOnce) {
           this.sentOnce = true;
@@ -176,26 +236,22 @@ class DiscordPresence {
         }
       })
       .catch((err) => {
-        log('Не удалось обновить присутствие:', err && err.message ? err.message : err);
-        if (!this.degraded && activity.smallImageKey) {
-          this.degraded = true;
-          log('Пробую без маленькой иконки (режим совместимости)…');
-          const fallback = { ...activity };
-          delete fallback.smallImageKey;
-          delete fallback.smallImageText;
-          this.client
-            .setActivity(fallback)
-            .then(() => log('Отправлено в упрощённом виде — маленькая иконка отключена.'))
-            .catch((err2) =>
-              log('Упрощённый вариант тоже отклонён:', err2 && err2.message ? err2.message : err2)
-            );
-        }
+        log('Не удалось обновить присутствие:', errText(err));
+        this.degraded = true;
+        log('Пробую без маленькой иконки (режим совместимости)…');
+        attempt(false)
+          .then(() => log('Отправлено в упрощённом виде — маленькая иконка отключена.'))
+          .catch((err2) => log('Упрощённый вариант тоже отклонён:', errText(err2)));
       });
   }
 
   clear() {
     if (!this.connected) return;
-    this.client.clearActivity().catch(() => {});
+    try {
+      this.client.request('CLEAR_ACTIVITY', { pid: process.pid }).catch(() => {});
+    } catch (_) {
+      /* клиент уже отключён */
+    }
   }
 
   destroy() {

@@ -138,6 +138,13 @@ function sendPlayerCommand(command) {
   }
 }
 
+/** Панель настроек ходит по своему каналу — это не плеерная команда. */
+function sendSettingsToggle() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('settings-toggle');
+  }
+}
+
 /* --------------------------------- Окно --------------------------------- */
 
 function createWindow() {
@@ -223,7 +230,7 @@ function createWindow() {
       event.preventDefault();
     } else if (ctrl && input.shift && key === 't') {
       // Ctrl+Shift+T — панель настроек VK Wave.
-      sendPlayerCommand('settings-toggle');
+      sendSettingsToggle();
       event.preventDefault();
     } else if (ctrl && !input.shift && key === 'r') {
       mainWindow.webContents.reload();
@@ -247,18 +254,28 @@ function injectTitleBarStyles() {
       background: var(--vkwave-bg, #141414) !important;
     }
     body::before {
-      content: '';
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: ${TITLEBAR_HEIGHT}px;
-      background: var(--vkwave-bg, #141414);
-      z-index: 2147483647;
-      -webkit-app-region: drag;
+      content: '' !important;
+      display: block !important;
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 100% !important;
+      height: ${TITLEBAR_HEIGHT}px !important;
+      background: var(--vkwave-bg, #141414) !important;
+      opacity: 1 !important;
+      z-index: 2147483647 !important;
+      -webkit-app-region: drag !important;
     }
+    /* Шапка ВК с лого и аккаунтом прячется целиком — над полосой остаётся
+       только системные кнопки окна. Кандидаты: то, чего нет в текущем DOM,
+       просто не срабатывает. */
+    body > header,
+    #page_header,
+    [id*="page_header"],
+    [class*="topProfileMenu"]
+    { display: none !important; }
   `;
-  mainWindow.webContents.insertCSS(css, { cssOrigin: 'user' }).catch(() => {});
+  mainWindow.webContents.insertCSS(css, { cssOrigin: 'author' }).catch(() => {});
   applyMusicOnly();
 }
 
@@ -366,7 +383,7 @@ function updateTray() {
         click: () => sendPlayerCommand('previous')
       },
       { type: 'separator' },
-      { label: 'Настройки', click: () => sendPlayerCommand('settings-toggle') },
+      { label: 'Настройки', click: () => sendSettingsToggle() },
       { label: 'Развернуть VK Wave', click: showMainWindow },
       { type: 'separator' },
       {
@@ -412,7 +429,14 @@ if (!gotSingleInstanceLock) {
     ipcMain.on('track-update', (_event, track) => {
       if (!track || typeof track !== 'object' || (!track.title && !track.artist)) return;
       lastTrack = track;
-      if (discord) discord.update(track);
+      // Ошибка Discord не должна ронять главный процесс — только лог.
+      if (discord) {
+        try {
+          discord.update(track);
+        } catch (_) {
+          /* уже залогировано внутри */
+        }
+      }
       updateTray();
     });
 
