@@ -374,7 +374,13 @@ async function updateTrayIcon(track) {
     return;
   }
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: {
+        // CDN ВК режет запросы без браузерного User-Agent.
+        'User-Agent': app.userAgentFallback,
+        Referer: 'https://vk.com/'
+      }
+    });
     if (!response.ok) return;
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.startsWith('image/')) return;

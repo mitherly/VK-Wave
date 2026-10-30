@@ -454,6 +454,37 @@ function readTitleFromDom(root) {
   };
 }
 
+/** Ещё один источник времени: прогресс-бар ВК — это aria-слайдер
+ * (aria-valuemax = длительность, aria-valuenow/valuetext = позиция). */
+function readTimesFromSlider(root) {
+  if (!root) return null;
+  const sliders = root.querySelectorAll('[role="slider"], [aria-valuemax]');
+  for (const slider of sliders) {
+    const max = parseFloat(slider.getAttribute('aria-valuemax') || '');
+    if (!Number.isFinite(max) || max <= 5) continue; // отсеиваем слайдер громкости
+    const now = parseFloat(slider.getAttribute('aria-valuenow') || '');
+    const text = slider.getAttribute('aria-valuetext') || '';
+    if (Number.isFinite(max)) {
+      return {
+        currentTime: Number.isFinite(now) && now >= 0 ? now : -1,
+        duration: max
+      };
+    }
+    const match = /(\d{1,2}:\d{2})(?:\D+(\d{1,2}:\d{2}))?/.exec(text);
+    if (match) {
+      const toSeconds = (value) => {
+        const parts = value.split(':').map(Number);
+        return parts[0] * 60 + parts[1];
+      };
+      return {
+        currentTime: toSeconds(match[1]),
+        duration: match[2] ? toSeconds(match[2]) : 0
+      };
+    }
+  }
+  return null;
+}
+
 function readTimesFromDom(root) {
   if (!root) return null;
   const timeNodes = Array.from(root.querySelectorAll('*')).filter((el) => {
@@ -515,6 +546,20 @@ function runExtraction() {
         if (times.currentTime >= 0) state.currentTime = times.currentTime;
       } else if (Math.abs(times.currentTime - state.currentTime) > 4) {
         state.currentTime = times.currentTime;
+      }
+    }
+
+    // Длительность так и не известна? Пробуем aria-слайдер прогресс-бара ВК.
+    if (!(state.duration > 0)) {
+      const sliderTimes = readTimesFromSlider(root);
+      if (sliderTimes) {
+        if (sliderTimes.duration > 0) state.duration = sliderTimes.duration;
+        if (
+          sliderTimes.currentTime >= 0 &&
+          Math.abs(sliderTimes.currentTime - state.currentTime) <= 30
+        ) {
+          state.currentTime = sliderTimes.currentTime;
+        }
       }
     }
   }
