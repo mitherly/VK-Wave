@@ -230,7 +230,9 @@ class DiscordPresence {
     this.botToken = (process.env.DISCORD_BOT_TOKEN || '').trim();
     this.clientSecret = (process.env.DISCORD_CLIENT_SECRET || '').trim();
     this.portalKeysPromise = null;
-    this.appTokenCache = null; // { token, expiresAt } — client_credentials
+    this.appTokenCache = null;      // { token, expiresAt } — client_credentials
+    this.rpcUserToken = null;       // Bearer-токен владельца (авторизация в Discord)
+    this.triedConsentPrompt = false;
     this.uploadedCoverNames = new Map(); // url → имя ассета в портале
 
     this.client.on('ready', () => {
@@ -275,11 +277,31 @@ class DiscordPresence {
   async connect() {
     if (this.connected || this.connecting) return;
     this.connecting = true;
+
+    const loginOptions = { clientId: CLIENT_ID };
+    if (this.clientSecret) {
+      // Авторизация владельца через Discord-клиент: даёт Bearer-токен для
+      // загрузки ассетов. Повторные запуски проходят молча (prompt: none),
+      // при первой авторизации Discord покажет окно «Разрешить».
+      loginOptions.clientSecret = this.clientSecret;
+      loginOptions.scopes = ['rpc'];
+      if (!this.triedConsentPrompt) loginOptions.prompt = 'none';
+    }
+
     try {
-      await this.client.login({ clientId: CLIENT_ID });
+      await this.client.login(loginOptions);
       // Дальше сработает событие 'ready'.
     } catch (err) {
       this.connecting = false;
+      // «prompt: none» непроходим при первой авторизации — зовём окно согласия.
+      if (this.clientSecret && !this.triedConsentPrompt) {
+        this.triedConsentPrompt = true;
+        log(
+          'Тихая авторизация недоступна. В Discord появится окно «VK Wave запрашивает доступ» — нажми «Разрешить».',
+          `(${errText(err)})`
+        );
+        return this.connect();
+      }
       if (!this.loggedLoginError) {
         this.loggedLoginError = true;
         log('Подключение не удалось:', errText(err));
@@ -296,6 +318,20 @@ class DiscordPresence {
       this.reconnectTimer = null;
       this.connect();
     }, RECONNECT_INTERVAL_MS);
+  }
+
+  /** Bearer-токен ВЛАДЕЛЬЦА: получаем через авторизацию в Discord-клиенте. */
+  async getRpcUserToken() {
+    if (!this.clientSecret) return null;
+    if (this.rpcUserToken) return this.rpcUserToken;
+    try {
+      const response = await this.client.request('AUTHENTICATE', {});
+      const token = response && response.data && response.data.access_token;
+      if (token) this.rpcUserToken = token;
+      return this.rpcUserToken || null;
+    } catch (_) {
+      return null;
+    }
   }
 
   /** Bearer-токен приложения через client_credentials (нужен CLIENT_SECRET). */
@@ -341,6 +377,30 @@ class DiscordPresence {
     if (this.portalKeysPromise) return this.portalKeysPromise;
     this.portalKeysPromise = (async () => {
       const errors = [];
+
+      // Путь 0 — Bearer-токен ВЛАДЕЛЬЦА (авторизация в Discord-клиенте):
+      // классическое тело {name, image}, маршрут владельца приложения.
+      const userToken = await this.getRpcUserToken();
+      if (userToken) {
+        try {
+          const existing = await apiRequest('GET', ASSETS_API, `Bearer ${userToken}`);
+          const names = new Set(existing.map((asset) => asset.name));
+          for (const key of ['logo', 'play', 'pause']) {
+            if (names.has(key)) continue;
+            const file = path.join(__dirname, 'assets', `${key}.png`);
+            if (!fs.existsSync(file)) continue;
+            await apiRequest('POST', ASSETS_API, `Bearer ${userToken}`, {
+              name: key,
+              image: bufferToDataUri(fileToImage(file))
+            });
+            await sleep(300);
+          }
+          log('Ассеты портала готовы (токен владельца): logo, play, pause.');
+          return { logo: 'logo', play: 'play', pause: 'pause' };
+        } catch (err) {
+          errors.push(`owner-bearer: ${errText(err)}`);
+        }
+      }
 
       // Путь 1 — Bearer-токен приложения (client_credentials) и классическое
       // тело {name, image}: маршрут владельца приложения, самый надёжный.
@@ -441,6 +501,20 @@ class DiscordPresence {
       if (!image) return null;
       const name = `cover_${sha1Short(url)}`;
       const errors = [];
+
+      const userToken = await this.getRpcUserToken();
+      if (userToken) {
+        try {
+          await apiRequest('POST', ASSETS_API, `Bearer ${userToken}`, {
+            name,
+            image: bufferToDataUri(image)
+          });
+          this.uploadedCoverNames.set(url, name);
+          return name;
+        } catch (err) {
+          errors.push(`owner-bearer: ${errText(err)}`);
+        }
+      }
 
       const appToken = await this.ensureAppToken();
       if (appToken) {
