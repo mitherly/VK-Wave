@@ -91,11 +91,18 @@ class DiscordPresence {
     this.connecting = false;
     this.reconnectTimer = null;
     this.lastTrack = null;
+    this.sentOnce = false;      // успешная отправка уже логировалась
+    this.loggedLoginError = false; // ошибка подключения уже логировалась
+    this.degraded = false;      // Discord не принял маленькую иконку — шлём без неё
 
     this.client.on('ready', () => {
       this.connected = true;
       this.connecting = false;
-      log('Подключено к Discord RPC.');
+      this.loggedLoginError = false;
+      log(
+        'Подключено к Discord RPC как',
+        this.client.user && this.client.user.username ? this.client.user.username : 'приложение'
+      );
       // Догоняем профиль актуальным треком после (пере)подключения.
       if (this.lastTrack) this.update(this.lastTrack);
     });
@@ -124,8 +131,12 @@ class DiscordPresence {
     try {
       await this.client.login({ clientId: CLIENT_ID });
       // Дальше сработает событие 'ready'.
-    } catch (_) {
+    } catch (err) {
       this.connecting = false;
+      if (!this.loggedLoginError) {
+        this.loggedLoginError = true;
+        log('Подключение не удалось:', err && err.message ? err.message : err);
+      }
       this.scheduleReconnect('Клиент Discord не запущен или недоступен');
     }
   }
@@ -145,9 +156,41 @@ class DiscordPresence {
     if (!this.connected || isClientIdMissing) return;
     const activity = buildActivity(track);
     if (!activity) return;
-    this.client.setActivity(activity).catch((err) => {
-      log('Не удалось обновить присутствие:', err && err.message ? err.message : err);
-    });
+    this.sendActivity(activity);
+  }
+
+  /** Отправка присутствия с самолечением: если Discord отверг маленькую
+   * иконку (внешние URL принимают не все сборки), повторяем без неё. */
+  sendActivity(activity) {
+    if (this.degraded && activity.smallImageKey) {
+      delete activity.smallImageKey;
+      delete activity.smallImageText;
+    }
+
+    this.client
+      .setActivity(activity)
+      .then(() => {
+        if (!this.sentOnce) {
+          this.sentOnce = true;
+          log('Присутствие отправлено. Если в профиле его не видно — см. «Возможные проблемы» в README.');
+        }
+      })
+      .catch((err) => {
+        log('Не удалось обновить присутствие:', err && err.message ? err.message : err);
+        if (!this.degraded && activity.smallImageKey) {
+          this.degraded = true;
+          log('Пробую без маленькой иконки (режим совместимости)…');
+          const fallback = { ...activity };
+          delete fallback.smallImageKey;
+          delete fallback.smallImageText;
+          this.client
+            .setActivity(fallback)
+            .then(() => log('Отправлено в упрощённом виде — маленькая иконка отключена.'))
+            .catch((err2) =>
+              log('Упрощённый вариант тоже отклонён:', err2 && err2.message ? err2.message : err2)
+            );
+        }
+      });
   }
 
   clear() {

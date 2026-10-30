@@ -16,7 +16,7 @@
  *     принимает команды управления из трея: 'player-command'.
  */
 
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, webFrame } = require('electron');
 
 /* ------------------------------- Константы ------------------------------- */
 
@@ -87,6 +87,13 @@ const ARIA_HINTS = {
   pause: ['пауза', 'останов', 'pause'],
   next: ['следующ', 'next'],
   previous: ['предыдущ', 'previous', 'назад']
+};
+
+/* Имена методов легаси-API плеера ВК (window.ap) в основном мире страницы. */
+const AP_METHODS = {
+  toggle: ['togglePause', 'togglePlay', 'toggle'],
+  next: ['next', 'playNext', 'nextTrack'],
+  previous: ['prev', 'previous', 'playPrev', 'prevTrack']
 };
 
 function isVisible(el) {
@@ -169,18 +176,84 @@ function findControl(kind) {
   return null;
 }
 
-function pressControl(kind) {
+/** Клик по кнопке плеера в основном мире ВК: window.ap (если жив легаси-API). */
+function pressViaPlayerApi(kind) {
+  const names = AP_METHODS[kind];
+  if (!names || !names.length) return Promise.resolve(false);
+  const script =
+    `(function(){try{var a=window.ap;` +
+    `if(!a&&window.AudioPlayer&&typeof window.AudioPlayer.getInstance==="function"){try{a=window.AudioPlayer.getInstance();}catch(e){}}` +
+    `if(!a)return false;var m=${JSON.stringify(names)};` +
+    `for(var i=0;i<m.length;i++){if(typeof a[m[i]]==="function"){a[m[i]]();return m[i];}}}catch(e){}return false;})()`;
+  try {
+    return Promise.resolve(webFrame.executeJavaScript(script, true))
+      .then((result) => !!result)
+      .catch(() => false);
+  } catch (_) {
+    return Promise.resolve(false);
+  }
+}
+
+/**
+ * Позиционная эвристика: aria/классы не сработали — берём кнопку play
+ * (находится надёжно) и ищем соседей слева/справа в том же ряду плеера.
+ * У ВК порядок кнопок стабилен: [перемешать] [назад] [play] [вперёд] [повтор].
+ */
+function findRelativeTransportButton(kind) {
+  if (kind !== 'next' && kind !== 'previous') return null;
+  const toggle = findControl('toggle');
+  if (!toggle) return null;
+  const root = findPlayerRoot() || document;
+  const tRect = toggle.getBoundingClientRect();
+  if (!tRect.width && !tRect.height) return null;
+
+  const tX = tRect.left + tRect.width / 2;
+  const tY = tRect.top + tRect.height / 2;
+  const rowTolerance = Math.max(tRect.height * 0.75, 24);
+
+  const candidates = Array.from(root.querySelectorAll('button, [role="button"]'))
+    .map((el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        el,
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2,
+        hidden: !r.width && !r.height
+      };
+    })
+    .filter((c) => !c.hidden && c.el !== toggle && Math.abs(c.y - tY) <= rowTolerance)
+    .sort((a, z) => a.x - z.x);
+
+  const side = candidates.filter((c) =>
+    kind === 'previous' ? c.x < tX - 4 : c.x > tX + 4
+  );
+  const target = kind === 'previous' ? side[side.length - 1] : side[0];
+  return target ? target.el : null;
+}
+
+async function pressControl(kind) {
+  // 1) Прямой вызов API плеера ВК (основной мир) — самый надёжный путь.
+  if (await pressViaPlayerApi(kind)) return true;
+  // 2) Классы/aria-label, если ВК их отдаёт.
   const el = findControl(kind);
-  if (!el) return false;
-  el.click();
-  return true;
+  if (el) {
+    el.click();
+    return true;
+  }
+  // 3) Позиционная эвристика вокруг кнопки play.
+  const relative = findRelativeTransportButton(kind);
+  if (relative) {
+    relative.click();
+    return true;
+  }
+  return false;
 }
 
 /** play/pause из MediaSession и трея: нажимаем тумблер только когда нужно. */
-function handleTransportAction(action) {
+async function handleTransportAction(action) {
   if (action === 'play' && state.isPlaying) return;
   if (action === 'pause' && !state.isPlaying) return;
-  pressControl('toggle');
+  await pressControl('toggle');
 }
 
 function seekBy(offsetSec) {
