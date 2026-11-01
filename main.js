@@ -16,10 +16,15 @@ const {
   nativeImage,
   ipcMain,
   shell,
-  session
+  session,
+  net
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { execFile } = require('child_process');
+// Node-овский fetch (undici) в main лезет через IPv6 и умирает там, где его нет
+// (fetch failed на lrclib.net при рабочем IPv4). Отныне IPv4 — первый.
+require('dns').setDefaultResultOrder('ipv4first');
 
 const { DiscordPresence } = require('./discord');
 
@@ -35,12 +40,18 @@ app.userAgentFallback = app.userAgentFallback
 
 const DEFAULT_SETTINGS = {
   musicOnly: true,   // «Только музыка»: редирект на /music + скрытие лишнего ВК
-  hotkeys: true,     // Space — пауза, Ctrl+←/→ — треки
+  hotkeys: true,     // Space — пауза, Ctrl+←/→ — треки, L — текст песни
   autoLaunch: false, // запускать с Windows
   startInTray: false, // стартовать свёрнутым в трей
   trayCover: true,   // иконка трея = обложка текущего трека
+  blockTrackers: true, // резать рекламу/метрики ВК на подлёте
+  ambientCover: true,  // размытая обложка фоном окна
+  vinylMode: false,    // обложка-винил: вращается, пока играет
+  accentFromCover: false, // акцент темы подмешивается из цвета обложки
+  autoDayNight: false, // авто-тема: день light / ночь midnight
+  backgroundMaterial: 'none', // none | mica | acrylic (Win11)
   theme: {
-    preset: 'default', // default | oled | midnight | light | sakura | emerald | lavender | amber | custom
+    preset: 'default', // default | oled | midnight | light | sakura | emerald | lavender | amber | cyberpunk | ocean | graphite | coffee | neon | halloween | custom
     background: '#141414',
     cards: '#1d1d22',
     accent: '#0077ff',
@@ -148,7 +159,281 @@ function sendSettingsToggle() {
   }
 }
 
-/* --------------------------------- Окно --------------------------------- */
+/** Панель текста песни (караоке) — тоже отдельный канал. */
+function sendLyricsToggle() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('lyrics-toggle');
+  }
+}
+
+/* --------------------------- Пресеты тем (main) --------------------------- */
+/* Дубликат THEME_PRESETS из preload: нужен для авто день/ночь в главном процессе. */
+
+const THEME_PRESETS = {
+  default: { background: '#141414', cards: '#1d1d22', accent: '#0077ff', radius: 16 },
+  oled: { background: '#000000', cards: '#101014', accent: '#0077ff', radius: 14 },
+  midnight: { background: '#0e1322', cards: '#172033', accent: '#5b8cff', radius: 18 },
+  light: { background: '#edeef0', cards: '#ffffff', accent: '#0077ff', radius: 16 },
+  sakura: { background: '#201622', cards: '#2b1f30', accent: '#ff7eb6', radius: 20 },
+  emerald: { background: '#0d1a13', cards: '#142520', accent: '#2ecc8f', radius: 16 },
+  lavender: { background: '#171225', cards: '#221b33', accent: '#a78bfa', radius: 18 },
+  amber: { background: '#1f1810', cards: '#2b2318', accent: '#ffb14a', radius: 16 },
+  cyberpunk: { background: '#0b0f14', cards: '#131a24', accent: '#00ffd5', radius: 12 },
+  ocean: { background: '#0b1b2a', cards: '#12283d', accent: '#38bdf8', radius: 18 },
+  graphite: { background: '#161719', cards: '#1f2124', accent: '#8e9aab', radius: 10 },
+  coffee: { background: '#191210', cards: '#241a15', accent: '#c98a5e', radius: 16 },
+  neon: { background: '#0d0a14', cards: '#161022', accent: '#e34fd0', radius: 14 },
+  halloween: { background: '#150d08', cards: '#221510', accent: '#ff7a1a', radius: 14 }
+};
+
+/* ------------------------- Обложка: данные и цвет ------------------------- */
+
+const coverDataCache = new Map(); // url → dataURL (для ambient-фона)
+
+/** Скачивает обложку (с браузерным UA — CDN ВК режет прочее) и возвращает dataURL. */
+async function fetchCoverDataUrl(url) {
+  if (coverDataCache.has(url)) return coverDataCache.get(url);
+  const response = await fetch(url, {
+    headers: { 'User-Agent': app.userAgentFallback, Referer: 'https://vk.com/' }
+  });
+  if (!response.ok) return null;
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.startsWith('image/')) return null;
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const image = nativeImage.createFromBuffer(buffer);
+  if (image.isEmpty()) return null;
+  const dataUrl = `data:${contentType};base64,${buffer.toString('base64')}`;
+  coverDataCache.set(url, dataUrl);
+  if (coverDataCache.size > 12) {
+    coverDataCache.delete(coverDataCache.keys().next().value);
+  }
+  return dataUrl;
+}
+
+/** Средний/доминирующий цвет обложки: 8×8 → самый насыщенный живой пиксель. */
+function extractCoverAccent(url) {
+  return fetchCoverDataUrl(url)
+    .then((dataUrl) => {
+      if (!dataUrl) return null;
+      const image = nativeImage.createFromDataURL(dataUrl).resize({ width: 8, height: 8 });
+      const size = image.getSize();
+      if (!size.width || !size.height) return null;
+      const bitmap = image.getBitmap(); // BGRA
+      let best = null;
+      let bestScore = -1;
+      let sr = 0;
+      let sg = 0;
+      let sb = 0;
+      let count = 0;
+      for (let i = 0; i + 3 < bitmap.length; i += 4) {
+        const r = bitmap[i + 2];
+        const g = bitmap[i + 1];
+        const b = bitmap[i];
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const sat = max === 0 ? 0 : (max - min) / max;
+        const light = max / 255;
+        sr += r; sg += g; sb += b; count += 1;
+        // живой цвет: заметно насыщенный, не вырванный в чёрный/белый
+        const score = sat * (light > 0.25 && light < 0.85 ? 1 : 0.2);
+        if (score > bestScore) {
+          bestScore = score;
+          best = [r, g, b];
+        }
+      }
+      // доминирующий слишком серый? берём средний цвет
+      if (!best || bestScore < 0.18) {
+        if (!count) return null;
+        best = [Math.round(sr / count), Math.round(sg / count), Math.round(sb / count)];
+      }
+      return `#${best.map((c) => c.toString(16).padStart(2, '0')).join('')}`;
+    })
+    .catch(() => null);
+}
+
+/* ------------------------------ Лирикс (LRCLIB) --------------------------- */
+
+const lyricsCache = new Map(); // 'artist|title|dur' → { synced, plain }
+
+/** Чистим мусор из названий, который сбивает поиск LRCLIB. */
+function cleanLyricsQuery(s) {
+  return String(s || '')
+    .replace(/\s*\((?:feat|ft|with)[^)]*\)/gi, '')
+    .replace(/\s*\[[^\]]*\]/g, '')
+    .replace(/\s*[-–—]\s*(?:remix|cover|live|acoustic|radio edit).*$/i, '')
+    .trim();
+}
+
+/* Транспорт к LRCLIB. Прямой ход из Chromium/Node-стека на части сетей РФ
+ * режется DPI по SNI (ERR_CONNECTION_RESET у Cloudflare), а системный curl
+ * проходит — поэтому сначала curl.exe (есть в Windows 10+), затем net.fetch.
+ * На сетях, где всё открыто, оба пути работают, разница незаметна. */
+
+function lrclibJsonViaCurl(url) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'curl',
+      ['-s', '--max-time', '9', '-H', `User-Agent: VK Wave/${app.getVersion()}`, url],
+      { windowsHide: true, timeout: 10000, maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) return reject(error);
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (_) {
+          reject(new Error('curl: некорректный JSON'));
+        }
+      }
+    );
+  });
+}
+
+async function lrclibJsonViaNet(url) {
+  const response = await net.fetch(url, {
+    headers: { 'User-Agent': `VK Wave/${app.getVersion()} (github.com/mitherly/VK-Wave)` }
+  });
+  if (!response.ok) throw new Error(`lrclib http ${response.status}`);
+  return response.json();
+}
+
+function lrclibJson(pathWithQuery) {
+  const url = `https://lrclib.net${pathWithQuery}`;
+  return lrclibJsonViaCurl(url).catch(() => lrclibJsonViaNet(url));
+}
+
+/** /api/get → {synced, plain} или null (включая JSON-ошибки 404). */
+async function lrclibLookup(pathWithQuery) {
+  try {
+    const data = await lrclibJson(pathWithQuery);
+    if (data && (data.syncedLyrics || data.plainLyrics)) {
+      return { synced: data.syncedLyrics || null, plain: data.plainLyrics || null };
+    }
+  } catch (_) {
+    /* 404/сеть — уйдём в search */
+  }
+  return null;
+}
+
+/** /api/search → массив вариантов. */
+async function lrclibList(pathWithQuery) {
+  try {
+    const data = await lrclibJson(pathWithQuery);
+    return Array.isArray(data) ? data : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function fetchLyrics({ artist, title, duration }) {
+  const key = `${artist}|${title}|${Math.round(duration || 0)}`;
+  if (lyricsCache.has(key)) return lyricsCache.get(key);
+  console.log(`[VK Wave · Lyrics] запрос: "${artist}" — "${title}" (${Math.round(duration)}с)`);
+
+  try {
+    const qArtist = cleanLyricsQuery(artist);
+    const qTitle = cleanLyricsQuery(title);
+    // Точный запрос: artist+title+duration — LRCLIB отдаёт лучший вариант.
+    let result = await lrclibLookup(
+      `/api/get?artist_name=${encodeURIComponent(qArtist)}` +
+      `&track_name=${encodeURIComponent(qTitle)}` +
+      (duration > 0 ? `&duration=${Math.round(duration)}` : '')
+    );
+    // Фолбэк: поиск без duration — берём ближайший по длительности вариант.
+    if (!result) {
+      const list = await lrclibList(
+        `/api/search?track_name=${encodeURIComponent(qTitle)}` +
+        `&artist_name=${encodeURIComponent(qArtist)}`
+      );
+      if (Array.isArray(list) && list.length) {
+        let pick = list[0];
+        if (duration > 0) {
+          let bestDelta = Infinity;
+          for (const item of list) {
+            const delta = Math.abs((item.duration || 0) - duration);
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              pick = item;
+            }
+          }
+        }
+        if (pick && (pick.syncedLyrics || pick.plainLyrics)) {
+          result = { synced: pick.syncedLyrics || null, plain: pick.plainLyrics || null };
+        }
+      }
+    }
+    lyricsCache.set(key, result);
+    if (lyricsCache.size > 60) lyricsCache.delete(lyricsCache.keys().next().value);
+    console.log(
+      `[VK Wave · Lyrics] ${result ? (result.synced ? 'синхронизированный текст найден' : 'только простой текст') : 'текст не найден'}`
+    );
+    return result;
+  } catch (error) {
+    console.log('[VK Wave · Lyrics] ошибка:', error && error.message);
+    return null;
+  }
+}
+
+/* ------------------------------- Sleep-таймер ------------------------------ */
+
+let sleepTimer = null;
+
+function setSleepTimer(minutes) {
+  if (sleepTimer) {
+    clearTimeout(sleepTimer);
+    sleepTimer = null;
+  }
+  if (!minutes || minutes <= 0) return null;
+  sleepTimer = setTimeout(() => {
+    sleepTimer = null;
+    sendPlayerCommand('pause');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('sleep-fired');
+    }
+  }, minutes * 60 * 1000);
+  return Date.now() + minutes * 60 * 1000;
+}
+
+/* ---------------------- Авто-тема день/ночь (60 сек) ----------------------- */
+
+function desiredDayNightPreset() {
+  const hour = new Date().getHours();
+  return hour >= 21 || hour < 7 ? 'midnight' : 'light';
+}
+
+function applyAutoDayNight() {
+  if (!settings.autoDayNight) return;
+  const desired = desiredDayNightPreset();
+  if (settings.theme.preset === desired) return;
+  // Перекрашиваем только если сейчас стоит одна из парных тем — кастом не трогаем.
+  if (!['light', 'midnight'].includes(settings.theme.preset)) return;
+  settings.theme = { ...THEME_PRESETS[desired], preset: desired };
+  saveSettings();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('settings-updated', settings);
+  }
+}
+
+/* ----------------------- Блок рекламы/метрик ВК/сети ----------------------- */
+
+const TRACKER_BLOCKLIST = [
+  '*://*.top-fwz1.mail.ru/*',      // счётчик Рейтинг Mail.ru
+  '*://*.ad.mail.ru/*',            // баннерная сеть Mail.ru
+  '*://*.mradx.net/*',             // медиа-реклама VK Ads
+  '*://*.an.yandex.ru/*',          // рекламная сеть Яндекса
+  '*://*.mc.yandex.ru/*',          // метрика
+  '*://*.google-analytics.com/*',
+  '*://*.googletagmanager.com/*',
+  '*://*.doubleclick.net/*',
+  '*://*.googlesyndication.com/*'
+];
+
+function installTrackerBlocklist(targetSession) {
+  const filter = { urls: TRACKER_BLOCKLIST };
+  targetSession.webRequest.onBeforeRequest(filter, (details, callback) => {
+    // Флаг проверяем в момент запроса — тумблер в панели работает без перезапуска.
+    callback({ cancel: !!settings.blockTrackers });
+  });
+}
+
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -159,6 +444,12 @@ function createWindow() {
     show: false,
     title: WINDOW_TITLE,
     backgroundColor: '#141414',
+    // Mica/Acrylic на старте (Win11); дальше рулит applyBackgroundMaterial.
+    ...(process.platform === 'win32' &&
+      settings.backgroundMaterial &&
+      settings.backgroundMaterial !== 'none'
+      ? { backgroundMaterial: settings.backgroundMaterial }
+      : {}),
     autoHideMenuBar: true,
     icon: path.join(__dirname, 'assets', 'logo.png'),
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
@@ -340,7 +631,7 @@ function applyMusicOnly() {
   }
 }
 
-/** Применяет main-часть настроек: цвет рамки, musicOnly, автозапуск. */
+/** Применяет main-часть настроек: цвет рамки, mica/acrylic, musicOnly, автозапуск. */
 function applySettingsToWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
@@ -351,9 +642,22 @@ function applySettingsToWindow() {
   } catch (_) {
     /* titleBarOverlay доступен не на всех платформах */
   }
+  applyBackgroundMaterial();
   if (!settings.trayCover) resetTrayIcon();
   applyMusicOnly();
   applyAutoLaunch();
+}
+
+/** Mica/Acrylic — только Windows 11 (build 22000+). Экспериментально:
+ * виден там, где фон страницы полупрозрачен (preload подмешивает альфу). */
+function applyBackgroundMaterial() {
+  if (process.platform !== 'win32') return;
+  const material = settings.backgroundMaterial;
+  try {
+    mainWindow.setBackgroundMaterial(material === 'none' ? 'auto' : material);
+  } catch (_) {
+    /* старая сборка Windows или материал недоступен */
+  }
 }
 
 /* --------------------------------- Трей --------------------------------- */
@@ -432,6 +736,7 @@ function updateTray() {
         click: () => sendPlayerCommand('previous')
       },
       { type: 'separator' },
+      { label: 'Текст песни', click: () => sendLyricsToggle() },
       { label: 'Настройки', click: () => sendSettingsToggle() },
       { label: 'Развернуть VK Wave', click: showMainWindow },
       { type: 'separator' },
@@ -444,6 +749,31 @@ function updateTray() {
       }
     ])
   );
+}
+
+/* ---------------------------- Автообновления ------------------------------ */
+/* electron-updater в dev-режиме не работает — включаем только в собранном app.
+   Тихо проверяем GitHub Releases при старте и раз в 6 часов; ставим при выходе. */
+
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+function setupAutoUpdater() {
+  if (!app.isPackaged) return;
+  try {
+    const { autoUpdater } = require('electron-updater');
+    autoUpdater.autoDownload = true;
+    autoUpdater.autoInstallOnAppQuit = true;
+    autoUpdater.logger = null; // без логов в консоль продакшена
+
+    const check = () => {
+      autoUpdater.checkForUpdates().catch(() => {});
+    };
+
+    check();
+    setInterval(check, SIX_HOURS_MS);
+  } catch (_) {
+    /* electron-updater недоступен — обновления вручную с GitHub */
+  }
 }
 
 /* ------------------------------- Запуск app ------------------------------ */
@@ -460,6 +790,7 @@ if (!gotSingleInstanceLock) {
 
     loadSettings();
     applyAutoLaunch();
+    applyAutoDayNight(); // старт в правильной половине суток
 
     // Разрешаем только нужные странице разрешения (медиа, фулскрин, уведомления).
     const vkSession = session.fromPartition('persist:vkwave');
@@ -473,6 +804,8 @@ if (!gotSingleInstanceLock) {
       ];
       callback(allowed.includes(permission));
     });
+
+    installTrackerBlocklist(vkSession);
 
     // Сводка о треке из preload-перехватчика.
     ipcMain.on('track-update', (_event, track) => {
@@ -488,7 +821,62 @@ if (!gotSingleInstanceLock) {
       }
       updateTray();
       updateTrayIcon(track).catch(() => {});
+
+      // Обложка → ambient-фон и акцент: отдаём рендеру при смене обложки.
+      if (track.coverUrl && (settings.ambientCover || settings.accentFromCover)) {
+        fetchCoverDataUrl(track.coverUrl)
+          .then((dataUrl) => {
+            if (!dataUrl || !mainWindow || mainWindow.isDestroyed()) return;
+            if (settings.ambientCover) {
+              mainWindow.webContents.send('cover-image', dataUrl);
+            }
+            if (settings.accentFromCover) {
+              return extractCoverAccent(track.coverUrl).then((hex) => {
+                if (hex && mainWindow && !mainWindow.isDestroyed()) {
+                  mainWindow.webContents.send('cover-accent', hex);
+                }
+              });
+            }
+            return null;
+          })
+          .catch(() => {});
+      }
     });
+
+    // Лирикс: прокси к LRCLIB из main — CSP и CORS страницы не мешают.
+    ipcMain.handle('lyrics:get', (_event, query) => {
+      if (!query || typeof query !== 'object') return null;
+      const artist = String(query.artist || '').trim();
+      const title = String(query.title || '').trim();
+      if (!artist || !title) return null;
+      const duration = Number(query.duration) || 0;
+      return fetchLyrics({ artist, title, duration });
+    });
+
+    // Диагностика памяти: честные цифры по процессам для панели настроек.
+    ipcMain.handle('memory:stats', () => {
+      try {
+        const metrics = app.getAppMetrics();
+        const rows = metrics.map((m) => ({
+          type: m.type || 'process',
+          pid: m.pid,
+          mb: m.memory ? m.memory.workingSetSize / 1024 : 0
+        }));
+        return {
+          rows,
+          total: rows.reduce((sum, r) => sum + r.mb, 0),
+          appUptimeMin: Math.round(process.uptime() / 60)
+        };
+      } catch (_) {
+        return null;
+      }
+    });
+
+    // Sleep-таймер: пауза через N минут. Возвращает метку окончания.
+    ipcMain.handle('sleep:set', (_event, minutes) => setSleepTimer(Number(minutes) || 0));
+
+    // Авто-тема день/ночь: проверка каждый час в половине случаев выстрелит в момент.
+    setInterval(applyAutoDayNight, 60 * 1000);
 
     // Настройки из панели VK Wave (Ctrl+Shift+T / трей).
     ipcMain.handle('settings:get', () => settings);
@@ -500,6 +888,17 @@ if (!gotSingleInstanceLock) {
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('settings-updated', settings);
       });
+      // Ambient включили посреди сессии — сразу отправляем текущую обложку,
+      // не дожидаясь следующего трека.
+      if (settings.ambientCover && lastTrack && lastTrack.coverUrl) {
+        fetchCoverDataUrl(lastTrack.coverUrl)
+          .then((dataUrl) => {
+            if (dataUrl && mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('cover-image', dataUrl);
+            }
+          })
+          .catch(() => {});
+      }
       return settings;
     });
 
@@ -508,6 +907,8 @@ if (!gotSingleInstanceLock) {
 
     discord = new DiscordPresence();
     discord.start();
+
+    setupAutoUpdater();
 
     app.on('activate', () => showMainWindow());
   });

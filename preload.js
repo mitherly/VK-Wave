@@ -24,7 +24,7 @@ const POLL_INTERVAL_MS = 750;          // период опроса MediaSession
 const MUTATION_DEBOUNCE_MS = 500;      // антидребезг MutationObserver
 const SEEK_THRESHOLD_SEC = 3;          // прыжок позиции больше этого — перемотка
 const KEEPALIVE_INTERVAL_MS = 120000;  // периодический ре-синк присутствия
-const FALLBACK_SCAN_INTERVAL_MS = 3000;// троттлинг тяжёлого поиска плеера
+const FALLBACK_SCAN_INTERVAL_MS = 8000;// троттлинг тяжёлого поиска плеера
 
 /* ------------------------------- Состояние ------------------------------- */
 
@@ -41,10 +41,21 @@ const state = {
   lastSentAt: 0,
   mutationTimer: null,
   lastRootScanAt: 0,
-  playerRoot: null
+  playerRoot: null,
+  coverAccent: null,      // цвет, вытащенный из обложки (main присылает hex)
+  lyrics: null,           // { synced: [{time,text}], plain: string|null, key }
+  lyricsOpen: false,
+  prefetchKey: null,      // ключ трека, для которого лирикс уже запрошен
+  lastVinylEl: null       // элемент обложки, на который надет «винил»
 };
 
 let appSettings = null; // сводка настроек из главного процесса
+
+/* ---------------------------- Сигнатура трека ----------------------------- */
+
+function trackKey() {
+  return `${state.artist || ''}—${state.title || ''}`;
+}
 
 /* --------------------- Управление плеером (DOM-клики) -------------------- */
 
@@ -337,6 +348,7 @@ function onTimeUpdate(event) {
       /* seekable недоступен для этого источника */
     }
   }
+  updateLyricsHighlight();
   maybeSend();
 }
 
@@ -537,15 +549,15 @@ function runExtraction() {
       }
     }
 
-    const times = readTimesFromDom(root);
-    if (times) {
-      if (times.duration > 0 && Math.abs(times.duration - state.duration) > 1) {
-        state.duration = times.duration;
-      }
-      if (!state.activeMedia) {
+    // Тяжёлый проход по всем узлам нужен только без живого <audio> —
+    // с активным элементом время точнее из timeupdate.
+    if (!state.activeMedia) {
+      const times = readTimesFromDom(root);
+      if (times) {
+        if (times.duration > 0 && Math.abs(times.duration - state.duration) > 1) {
+          state.duration = times.duration;
+        }
         if (times.currentTime >= 0) state.currentTime = times.currentTime;
-      } else if (Math.abs(times.currentTime - state.currentTime) > 4) {
-        state.currentTime = times.currentTime;
       }
     }
 
@@ -584,6 +596,13 @@ function sendTrackUpdate(now, payload) {
   state.lastSent = payload;
   state.lastSentAt = now;
   ipcRenderer.send('track-update', payload);
+
+  // Визуальные эффекты и лирикс-префетч — следом за сводкой о треке.
+  syncEffectClasses();
+  if (appSettings && appSettings.vinylMode) applyVinyl();
+  if (payload.title && payload.artist && state.prefetchKey !== lyricsRequestId()) {
+    requestLyrics(); // фоновой prefetch: панель откроется с готовым текстом
+  }
 }
 
 /**
@@ -618,6 +637,375 @@ function maybeSend() {
   }
 }
 
+/* -------------------- Волна в тайтлбаре, винил, ambient ------------------- */
+
+const WAVE_CSS = `
+  #vkwave-wave {
+    position: fixed; top: 0; left: 0; width: 100%; height: 34px;
+    z-index: 2147483647; pointer-events: none;
+    -webkit-app-region: drag;
+    opacity: 0; transition: opacity .4s ease;
+    overflow: hidden;
+  }
+  body.vkwave-wave-on #vkwave-wave { opacity: 1; }
+  #vkwave-wave svg { position: absolute; left: 0; top: 0; width: 200%; height: 34px; }
+  #vkwave-wave path { fill: var(--vkwave-accent, #0077ff); }
+  #vkwave-wave .vkwave-wfront { opacity: .38; animation: vkwave-drift 9s linear infinite; animation-play-state: paused; }
+  #vkwave-wave .vkwave-wback { opacity: .16; animation: vkwave-drift 14s linear infinite reverse; animation-play-state: paused; }
+  body.vkwave-playing #vkwave-wave .vkwave-wfront,
+  body.vkwave-playing #vkwave-wave .vkwave-wback { animation-play-state: running; }
+  @keyframes vkwave-drift {
+    from { transform: translateX(0); }
+    to   { transform: translateX(-240px); }
+  }
+  /* Винил-режим: обложка в плеере ВК становится пластинкой. */
+  .vkwave-vinyl {
+    border-radius: 50% !important;
+    animation: vkwave-spin 12s linear infinite;
+    animation-play-state: paused;
+  }
+  body.vkwave-playing .vkwave-vinyl { animation-play-state: running; }
+  @keyframes vkwave-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+  /* Ambient-фон: размытая обложка за интерфейсом. */
+  #vkwave-ambient {
+    position: fixed; inset: -40px; z-index: -1;
+    background-position: center; background-size: cover;
+    filter: blur(52px) saturate(1.25);
+    transform: scale(1.1);
+    opacity: 0; transition: opacity .8s ease;
+    pointer-events: none;
+  }
+  body.vkwave-ambient-on #vkwave-ambient { opacity: .55; }
+`;
+
+/** Ambient реально включён (есть и настройка, и обложка)? */
+function ambientActive() {
+  return !!(appSettings && appSettings.ambientCover && state.coverUrl);
+}
+
+// Бесшовный тайл волны: квадратичные T-сегменты с периодом 60px — начало
+// и конец паттерна совпадают по позиции И наклону, стыков невидно.
+const WAVE_PATTERN_D =
+  'M0 20 Q 15 12 30 20 T 60 20 T 90 20 T 120 20 T 150 20 T 180 20 T 210 20 T 240 20 L 240 34 L 0 34 Z';
+
+let waveEl = null;
+
+function buildWave() {
+  if (waveEl && waveEl.isConnected) return;
+  if (!document.getElementById('vkwave-wave-style')) {
+    const style = document.createElement('style');
+    style.id = 'vkwave-wave-style';
+    style.textContent = WAVE_CSS;
+    (document.head || document.documentElement).appendChild(style);
+  }
+  waveEl = document.createElement('div');
+  waveEl.id = 'vkwave-wave';
+  // Инлайн-SVG: path наследует var(--vkwave-accent) — волна живёт в теме.
+  waveEl.innerHTML =
+    `<svg xmlns="http://www.w3.org/2000/svg">` +
+    `<defs>` +
+    `<pattern id="vkwave-wp-f" width="240" height="34" patternUnits="userSpaceOnUse"><path d="${WAVE_PATTERN_D}"/></pattern>` +
+    `<pattern id="vkwave-wp-b" width="240" height="34" patternUnits="userSpaceOnUse"><path d="${WAVE_PATTERN_D}"/></pattern>` +
+    `</defs>` +
+    `<rect class="vkwave-wback" width="200%" height="34" fill="url(#vkwave-wp-b)"/>` +
+    `<rect class="vkwave-wfront" width="200%" height="34" fill="url(#vkwave-wp-f)"/>` +
+    `</svg>`;
+  document.body.appendChild(waveEl);
+}
+
+let ambientEl = null;
+
+function buildAmbient() {
+  if (ambientEl && ambientEl.isConnected) return;
+  ambientEl = document.createElement('div');
+  ambientEl.id = 'vkwave-ambient';
+  const gradient =
+    'linear-gradient(180deg, rgba(0,0,0,.32), rgba(0,0,0,.62))';
+  ambientEl.style.backgroundImage = `${gradient}, var(--vkwave-cover-image, none)`;
+  document.body.appendChild(ambientEl);
+}
+
+/** Обложка пришла из main (dataURL): красим ambient-фон. */
+function onCoverImage(dataUrl) {
+  if (!dataUrl) return;
+  buildAmbient();
+  document.documentElement.style.setProperty(
+    '--vkwave-cover-image',
+    `url("${dataUrl}")`
+  );
+  syncEffectClasses();
+}
+
+function syncEffectClasses() {
+  if (!document.body) return;
+  const s = appSettings || {};
+  document.body.classList.toggle('vkwave-playing', !!state.isPlaying);
+  // Волна включена по умолчанию; тумблера нет — она и есть «подпись» клиента.
+  buildWave();
+  document.body.classList.toggle('vkwave-wave-on', true);
+  document.body.classList.toggle(
+    'vkwave-ambient-on',
+    !!s.ambientCover && !!state.coverUrl
+  );
+}
+
+/** Винил: навешиваем класс на текущий элемент обложки в плеере ВК. */
+function applyVinyl() {
+  if (!appSettings || !appSettings.vinylMode) return;
+  const root = findPlayerRoot();
+  if (!root) return;
+  const coverEl =
+    root.querySelector('img') ||
+    root.querySelector('[style*="background-image"]');
+  if (!coverEl || coverEl === state.lastVinylEl) return;
+  if (state.lastVinylEl) state.lastVinylEl.classList.remove('vkwave-vinyl');
+  coverEl.classList.add('vkwave-vinyl');
+  state.lastVinylEl = coverEl;
+}
+
+function disableVinyl() {
+  if (state.lastVinylEl) {
+    state.lastVinylEl.classList.remove('vkwave-vinyl');
+    state.lastVinylEl = null;
+  }
+}
+
+/* --------------- Точное время из API плеера ВК (главный мир) --------------- */
+/* У нового плеера ВК нет <audio> в DOM (звук идёт мимо документа), поэтому
+   timeupdate не тикает. Зато жив window.ap: getCurrentProgressTime() (мс),
+   getCurrentDuration() (с), isPlaying(). Опрашиваем его тем же паттерном,
+   что и кнопки управления — это источник времени для караоке и Discord. */
+
+function syncApState() {
+  const script =
+    '(function(){try{var a=window.ap;' +
+    'if(!a||typeof a.getCurrentProgressTime!=="function")return null;' +
+    'return {t:a.getCurrentProgressTime()/1000,d:Number(a.getCurrentDuration())||0,' +
+    'playing:(typeof a.isPlaying==="function")?!!a.isPlaying():null};}catch(e){return null;}})()';
+  return webFrame
+    .executeJavaScript(script, true)
+    .then((st) => {
+      if (!st || typeof st.t !== 'number' || !Number.isFinite(st.t) || st.t < 0) return;
+      if (state.activeMedia) return; // старый DOM-плеер: элементные события точнее
+      state.currentTime = st.t;
+      if (st.d > 0 && Number.isFinite(st.d)) state.duration = st.d;
+      if (st.playing !== null) state.isPlaying = st.playing;
+      updateLyricsHighlight();
+      maybeSend();
+    })
+    .catch(() => {});
+}
+
+/* ------------------------------ Лирикс-панель ----------------------------- */
+
+const LYRICS_CSS = `
+  #vkwave-lyrics {
+    position: fixed; top: 46px; right: 12px; width: 380px; max-height: 72vh;
+    background: #17171b; color: #e8eaf0;
+    border: 1px solid #2a2a31; border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .5);
+    padding: 14px; z-index: 2147483641;
+    font: 13px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+    transition: transform .18s ease, opacity .18s ease;
+  }
+  #vkwave-lyrics.vkwave-hidden { transform: translateX(24px); opacity: 0; pointer-events: none; }
+  #vkwave-lyrics .vkwave-lyrics__head {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    margin-bottom: 10px;
+  }
+  #vkwave-lyrics .vkwave-lyrics__title {
+    font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #vkwave-lyrics .vkwave-lyrics__x {
+    background: none; border: 0; color: #9aa0ab; font-size: 14px; cursor: pointer;
+    padding: 4px 8px; border-radius: 8px;
+  }
+  #vkwave-lyrics .vkwave-lyrics__x:hover { background: #232329; color: #fff; }
+  #vkwave-lyrics .vkwave-lyrics__body {
+    overflow-y: auto; scrollbar-width: thin; padding-right: 6px;
+  }
+  #vkwave-lyrics .vkwave-lyr {
+    padding: 5px 8px; border-radius: 8px; color: #8f96a3;
+    font-size: 13.5px; transition: background .15s ease, color .15s ease;
+  }
+  #vkwave-lyrics .vkwave-lyr.vkwave-lyr--active {
+    background: rgba(0, 119, 255, .16); color: #fff;
+    font-weight: 600;
+  }
+  #vkwave-lyrics .vkwave-lyr--plain { color: #c6cbd4; padding: 2px 0; }
+  #vkwave-lyrics .vkwave-lyrics__empty { color: #7d8590; padding: 18px 0; text-align: center; }
+`;
+
+let lyricsEl = null;
+let lyricsBodyEl = null;
+let lyricsActiveIndex = -1;
+let lyricsSyncTimer = null;
+
+function parseLrc(raw) {
+  const lines = [];
+  for (const line of String(raw).split('\n')) {
+    const match = /^\s*\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?\]\s*(.*)$/.exec(line);
+    if (!match) continue;
+    const time =
+      Number(match[1]) * 60 +
+      Number(match[2]) +
+      (match[3] ? Number(`0.${match[3]}`) : 0);
+    lines.push({ time, text: match[4].trim() });
+  }
+  lines.sort((a, b) => a.time - b.time);
+  return lines;
+}
+
+function lyricsRequestId() {
+  return `${state.artist || ''}|${state.title || ''}|${Math.round(state.duration || 0)}`;
+}
+
+/** Просим текст у main (LRCLIB-прокси) и рендерим панель, если она открыта. */
+async function requestLyrics(force) {
+  if (!state.title || !state.artist) return;
+  const key = lyricsRequestId();
+  if (!force && state.prefetchKey === key) return;
+  state.prefetchKey = key;
+
+  try {
+    const data = await ipcRenderer.invoke('lyrics:get', {
+      artist: state.artist,
+      title: state.title,
+      duration: state.duration
+    });
+    // Пока качали — трек сменился; складываем в state, но панель не перерисовываем зря.
+    if (lyricsRequestId() !== key) return;
+    if (data && data.synced) {
+      state.lyrics = { synced: parseLrc(data.synced), plain: null, key };
+    } else if (data && data.plain) {
+      state.lyrics = { synced: null, plain: data.plain, key };
+    } else {
+      state.lyrics = { synced: null, plain: null, key };
+    }
+    if (state.lyricsOpen) renderLyrics();
+  } catch (_) {
+    state.lyrics = null;
+  }
+}
+
+function renderLyrics() {
+  if (!lyricsEl || !state.lyricsOpen) return;
+  const head = lyricsEl.querySelector('.vkwave-lyrics__title');
+  if (head) head.textContent = `${state.artist} — ${state.title}`;
+
+  lyricsBodyEl.innerHTML = '';
+  lyricsActiveIndex = -1;
+
+  if (state.lyrics && Array.isArray(state.lyrics.synced) && state.lyrics.synced.length) {
+    for (const line of state.lyrics.synced) {
+      const div = document.createElement('div');
+      div.className = 'vkwave-lyr';
+      div.textContent = line.text || '♪';
+      lyricsBodyEl.appendChild(div);
+    }
+  } else if (state.lyrics && state.lyrics.plain) {
+    for (const text of state.lyrics.plain.split('\n')) {
+      const div = document.createElement('div');
+      div.className = 'vkwave-lyr vkwave-lyr--plain';
+      div.textContent = text || ' ';
+      lyricsBodyEl.appendChild(div);
+    }
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'vkwave-lyrics__empty';
+    empty.textContent =
+      state.lyrics
+        ? 'Текст не найден в LRCLIB 🙃'
+        : 'Ищу текст песни…';
+    lyricsBodyEl.appendChild(empty);
+  }
+}
+
+/** Караоке-подсветка: вызывается из onTimeUpdate. */
+function updateLyricsHighlight() {
+  if (!state.lyricsOpen || !state.lyrics || !state.lyrics.synced) return;
+  const lines = state.lyrics.synced;
+  let index = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].time <= state.currentTime) index = i;
+    else break;
+  }
+  if (index === lyricsActiveIndex) return;
+  lyricsActiveIndex = index;
+
+  const nodes = lyricsBodyEl.querySelectorAll('.vkwave-lyr');
+  if (nodes[lyricsActiveIndex]) {
+    for (const node of nodes) node.classList.remove('vkwave-lyr--active');
+    nodes[lyricsActiveIndex].classList.add('vkwave-lyr--active');
+    // Держим активную строку по центру, но не дёргаем прокрутку постоянно.
+    nodes[lyricsActiveIndex].scrollIntoView({
+      block: 'center',
+      behavior: 'smooth'
+    });
+  }
+}
+
+function buildLyricsPanel() {
+  if (lyricsEl && lyricsEl.isConnected) return;
+  const style = document.createElement('style');
+  style.id = 'vkwave-lyrics-style';
+  style.textContent = LYRICS_CSS;
+  (document.head || document.documentElement).appendChild(style);
+
+  lyricsEl = document.createElement('div');
+  lyricsEl.id = 'vkwave-lyrics';
+  lyricsEl.className = 'vkwave-hidden';
+  lyricsEl.innerHTML = `
+    <div class="vkwave-lyrics__head">
+      <span class="vkwave-lyrics__title"> Lyrics </span>
+      <button class="vkwave-lyrics__x" title="Закрыть (L)">✕</button>
+    </div>
+    <div class="vkwave-lyrics__body"></div>
+  `;
+  document.body.appendChild(lyricsEl);
+  lyricsBodyEl = lyricsEl.querySelector('.vkwave-lyrics__body');
+  lyricsEl.querySelector('.vkwave-lyrics__x').addEventListener('click', () => toggleLyrics());
+}
+
+function toggleLyrics(forceOpen) {
+  buildLyricsPanel();
+  const open = typeof forceOpen === 'boolean' ? forceOpen : !state.lyricsOpen;
+  state.lyricsOpen = open;
+  lyricsEl.classList.toggle('vkwave-hidden', !open);
+  if (open) {
+    // Панели делят правый край — не даём им толкаться.
+    const settingsPanel = document.getElementById('vkwave-panel');
+    if (settingsPanel) settingsPanel.classList.add('vkwave-hidden');
+    if (
+      !state.lyrics ||
+      state.lyrics.key !== lyricsRequestId() ||
+      (!state.lyrics.synced && !state.lyrics.plain && state.lyrics.key === lyricsRequestId())
+    ) {
+      // Новый трек или прошлый раз текста не было — переспрашиваем.
+      state.prefetchKey = null;
+      state.lyrics = null;
+      renderLyrics();
+      requestLyrics(true);
+    } else {
+      renderLyrics();
+    }
+  }
+}
+
+/** Применяет эффектные настройки поверх applyTheme — единая точка для
+ * sendSettings и broadcast'а settings-updated. */
+function applySettingsEffects(s) {
+  applyTheme(s);
+  syncEffectClasses();
+  if (s && s.vinylMode) applyVinyl();
+  else disableVinyl();
+}
+
 /* ----------------------- MutationObserver и команды ---------------------- */
 
 function setupMutationObserver() {
@@ -628,10 +1016,11 @@ function setupMutationObserver() {
       runExtraction();
     }, MUTATION_DEBOUNCE_MS);
   });
+  // Без attributes: ВК дёргает стиль прогресс-бара десятки раз в секунду —
+  // это самый горячий источник мутаций. Смены трека ловим по childList/characterData.
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
-    attributes: true,
     characterData: true
   });
 }
@@ -664,17 +1053,28 @@ const THEME_PRESETS = {
   sakura: { background: '#201622', cards: '#2b1f30', accent: '#ff7eb6', radius: 20 },
   emerald: { background: '#0d1a13', cards: '#142520', accent: '#2ecc8f', radius: 16 },
   lavender: { background: '#171225', cards: '#221b33', accent: '#a78bfa', radius: 18 },
-  amber: { background: '#1f1810', cards: '#2b2318', accent: '#ffb14a', radius: 16 }
+  amber: { background: '#1f1810', cards: '#2b2318', accent: '#ffb14a', radius: 16 },
+  cyberpunk: { background: '#0b0f14', cards: '#131a24', accent: '#00ffd5', radius: 12 },
+  ocean: { background: '#0b1b2a', cards: '#12283d', accent: '#38bdf8', radius: 18 },
+  graphite: { background: '#161719', cards: '#1f2124', accent: '#8e9aab', radius: 10 },
+  coffee: { background: '#191210', cards: '#241a15', accent: '#c98a5e', radius: 16 },
+  neon: { background: '#0d0a14', cards: '#161022', accent: '#e34fd0', radius: 14 },
+  halloween: { background: '#150d08', cards: '#221510', accent: '#ff7a1a', radius: 14 }
 };
 
 /** Базовое переопределение (если скан токенов ВК ничего не нашёл). */
-const VKUI_FALLBACK_CSS = `
+function vkuiFallbackCss() {
+  // При ambient фон-контейнеры ВК полупрозрачные — сквозь них видно обложку.
+  const bgToken = ambientActive()
+    ? 'color-mix(in srgb, var(--vkwave-cards) 72%, transparent)'
+    : 'var(--vkwave-cards)';
+  return `
   :root {
     --vkui--color_background: var(--vkwave-bg) !important;
     --vkui--color_background_page: var(--vkwave-bg) !important;
-    --vkui--color_background_content: var(--vkwave-cards) !important;
-    --vkui--color_background_secondary: var(--vkwave-cards) !important;
-    --vkui--color_background_tertiary: var(--vkwave-cards) !important;
+    --vkui--color_background_content: ${bgToken} !important;
+    --vkui--color_background_secondary: ${bgToken} !important;
+    --vkui--color_background_tertiary: ${bgToken} !important;
     --vkui--color_background_accent: var(--vkwave-accent) !important;
     --vkui--color_background_accent_tint: var(--vkwave-accent) !important;
     --vkui--color_stroke_accent: var(--vkwave-accent) !important;
@@ -685,6 +1085,7 @@ const VKUI_FALLBACK_CSS = `
   }
   body { background: var(--vkwave-bg) !important; }
 `;
+}
 
 let themeStyleEl = null;
 let vkuiTokensScanned = false;
@@ -730,7 +1131,11 @@ function mapVkuiToken(name) {
   const n = name.toLowerCase();
   if (/(_|)(negative|positive|warning)/.test(n)) return null;
   if (n.includes('accent') || n.includes('text_link')) return 'var(--vkwave-accent)';
-  if (n.includes('background')) return 'var(--vkwave-cards)';
+  if (n.includes('background')) {
+    return ambientActive()
+      ? 'color-mix(in srgb, var(--vkwave-cards) 72%, transparent)'
+      : 'var(--vkwave-cards)';
+  }
   if (n.includes('text') || n.includes('icon')) return 'var(--vkwave-text)';
   if (n.includes('stroke')) return 'var(--vkwave-stroke)';
   if (n.includes('overlay')) return 'rgba(0, 0, 0, 0.55)';
@@ -754,14 +1159,44 @@ function buildDeepThemeOverride() {
   return lines.join('\n');
 }
 
+/** Смешивает два hex-цвета: ratio — доля второго (обложечного). */
+function hexMix(hexA, hexB, ratio) {
+  const parse = (hex) => {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+    return m ? parseInt(m[1], 16) : null;
+  };
+  const a = parse(hexA);
+  const b = parse(hexB);
+  if (a === null) return hexB || hexA;
+  if (b === null) return hexA;
+  const mix = (sa, sb) => Math.round(sa * (1 - ratio) + sb * ratio);
+  const r = mix((a >> 16) & 255, (b >> 16) & 255);
+  const g = mix((a >> 8) & 255, (b >> 8) & 255);
+  const bl = mix(a & 255, b & 255);
+  return `#${((r << 16) | (g << 8) | bl).toString(16).padStart(6, '0')}`;
+}
+
 function applyTheme(s) {
   const t = (s && s.theme) || {};
-  const bg = t.background || '#141414';
+  let bg = t.background || '#141414';
   const light = isLightBackground(bg);
   const root = document.documentElement;
+
+  // Ambient-фон: сама «подложка» ВК слегка просвечивает — сквозь неё видна
+  // размытая обложка. Тайтлбар и карточки остаются плотными.
+  if (ambientActive()) {
+    bg = `color-mix(in srgb, ${bg} 78%, transparent)`;
+  }
+
+  // Акцент: подмешиваем цвет обложки (35%), если включено и цвет извлечён.
+  let accent = t.accent || '#0077ff';
+  if (s.accentFromCover && state.coverAccent) {
+    accent = hexMix(accent, state.coverAccent, 0.35);
+  }
+
   root.style.setProperty('--vkwave-bg', bg);
   root.style.setProperty('--vkwave-cards', t.cards || '#1d1d22');
-  root.style.setProperty('--vkwave-accent', t.accent || '#0077ff');
+  root.style.setProperty('--vkwave-accent', accent);
   root.style.setProperty('--vkwave-text', light ? '#1d1d22' : '#e8eaf0');
   root.style.setProperty('--vkwave-stroke', light ? 'rgba(0, 0, 0, 0.14)' : 'rgba(255, 255, 255, 0.14)');
   root.style.setProperty('--vkwave-radius', `${Number(t.radius) || 16}px`);
@@ -771,12 +1206,14 @@ function applyTheme(s) {
     themeStyleEl.id = 'vkwave-theme';
     (document.head || document.documentElement).appendChild(themeStyleEl);
   }
-  // Пресет «default» = родная тема ВК, ничего не перекрашиваем.
-  if (!t.preset || t.preset === 'default') {
+  // Пресет «default» = родная тема ВК... кроме ambient: тогда всё равно
+  // вмешиваемся, иначе VK рисует непрозрачные контейнеры поверх обложки.
+  const needOverride = ambientActive() || (t.preset && t.preset !== 'default');
+  if (!needOverride) {
     themeStyleEl.textContent = '';
     return;
   }
-  themeStyleEl.textContent = buildDeepThemeOverride() || VKUI_FALLBACK_CSS;
+  themeStyleEl.textContent = buildDeepThemeOverride() || vkuiFallbackCss();
 
   // Стили ВК могли догрузиться после первого прохода — один раз пересканируем.
   if (!vkuiTokensScanned) {
@@ -792,6 +1229,7 @@ function applyTheme(s) {
 const PANEL_CSS = `
   #vkwave-panel {
     position: fixed; top: 46px; right: 12px; width: 322px;
+    max-height: calc(100vh - 60px); overflow-y: auto; scrollbar-width: thin;
     background: #17171b; color: #e8eaf0;
     border: 1px solid #2a2a31; border-radius: 14px;
     box-shadow: 0 18px 48px rgba(0, 0, 0, .5);
@@ -818,6 +1256,12 @@ const PANEL_CSS = `
   #vkwave-panel .vkwave-btn:hover { background: #2b2b33; }
   #vkwave-panel .vkwave-btn--ghost { background: transparent; }
   #vkwave-panel .vkwave-panel__hint { margin-top: 10px; font-size: 11px; color: #7d8590; }
+  #vkwave-panel select {
+    background: #232329; color: #e8eaf0; border: 1px solid #2f2f37;
+    border-radius: 8px; padding: 4px 8px; font-size: 12px; cursor: pointer;
+  }
+  #vkwave-panel .vkwave-mem { margin-top: 6px; font-size: 11.5px; color: #aab2bf; line-height: 1.7; }
+  #vkwave-panel .vkwave-mem b { color: #e8eaf0; }
 `;
 
 const PANEL_HTML = `
@@ -836,25 +1280,65 @@ const PANEL_HTML = `
     <button data-preset="emerald" class="vkwave-chip">💚 Изумруд</button>
     <button data-preset="lavender" class="vkwave-chip">💜 Лаванда</button>
     <button data-preset="amber" class="vkwave-chip">🧡 Янтарная</button>
+    <button data-preset="cyberpunk" class="vkwave-chip">🤖 Киберпанк</button>
+    <button data-preset="ocean" class="vkwave-chip">🌊 Океан</button>
+    <button data-preset="graphite" class="vkwave-chip">🖤 Графит</button>
+    <button data-preset="coffee" class="vkwave-chip">☕ Кофе</button>
+    <button data-preset="neon" class="vkwave-chip">💜 Неон</button>
+    <button data-preset="halloween" class="vkwave-chip">🎃 Хэллоуин</button>
   </div>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autodaynight"> Авто день/ночь (Light ↔ Midnight)</label>
   <label class="vkwave-row">Фон окна <input type="color" id="vkwave-bg-input"></label>
   <label class="vkwave-row">Карточки <input type="color" id="vkwave-cards-input"></label>
   <label class="vkwave-row">Акцент <input type="color" id="vkwave-accent-input"></label>
   <label class="vkwave-row">Скругления <input type="range" id="vkwave-radius-input" min="0" max="32" step="2"></label>
 
+  <div class="vkwave-panel__section">Внешний вид</div>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-ambient"> Ambient-фон из обложки</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-vinyl"> Винил-режим обложки</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-accentcover"> Акцент из цвета обложки</label>
+  <label class="vkwave-row">Эффект окна (Win 11)
+    <select id="vkwave-material">
+      <option value="none">Выключен</option>
+      <option value="acrylic">Acrylic</option>
+      <option value="mica">Mica</option>
+    </select>
+  </label>
+
+  <div class="vkwave-panel__section">Плеер</div>
+  <label class="vkwave-row">
+    <button id="vkwave-lyrics-btn" class="vkwave-btn">🎤 Текст песни (L)</button>
+  </label>
+
   <div class="vkwave-panel__section">Поведение</div>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-musiconly"> Только музыка</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-traycover"> Обложка в трее</label>
-  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-hotkeys"> Хоткеи (Space, Ctrl+←/→)</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-hotkeys"> Хоткеи (Space, Ctrl+←/→, L)</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autolaunch"> Запускать с Windows</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-startintray"> Стартовать в трее</label>
+
+  <div class="vkwave-panel__section">Оптимизация</div>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-blocktrackers"> Блокировать рекламу и метрики</label>
+  <label class="vkwave-row">Sleep-таймер
+    <select id="vkwave-sleep">
+      <option value="0">Выключен</option>
+      <option value="15">15 минут</option>
+      <option value="30">30 минут</option>
+      <option value="60">60 минут</option>
+      <option value="90">90 минут</option>
+    </select>
+  </label>
+  <div class="vkwave-row">
+    <button id="vkwave-mem-btn" class="vkwave-btn">📊 Память</button>
+  </div>
+  <div id="vkwave-mem" class="vkwave-mem"></div>
 
   <div class="vkwave-panel__actions">
     <button id="vkwave-copy" class="vkwave-btn">Копировать тему</button>
     <button id="vkwave-paste" class="vkwave-btn">Вставить</button>
     <button id="vkwave-reset" class="vkwave-btn vkwave-btn--ghost">Сброс</button>
   </div>
-  <div class="vkwave-panel__hint">Тема перекрашивает все цветовые токены VKUI в стилях ВК (текст, иконки, обводки — автоматически). Семантические цвета ошибок/успеха остаются родными.</div>
+  <div class="vkwave-panel__hint">Тема перекрашивает все цветовые токены VKUI. Волна в тайтлбаре пляшет, пока играет музыка 🌊. Эффект окна — экспериментальный, только Win 11.</div>
 `;
 
 function flashButton(panel, selector, text) {
@@ -892,6 +1376,15 @@ function syncPanel(s) {
   setChecked('vkwave-hotkeys', s.hotkeys);
   setChecked('vkwave-autolaunch', s.autoLaunch);
   setChecked('vkwave-startintray', s.startInTray);
+  setChecked('vkwave-ambient', s.ambientCover);
+  setChecked('vkwave-vinyl', s.vinylMode);
+  setChecked('vkwave-accentcover', s.accentFromCover);
+  setChecked('vkwave-blocktrackers', s.blockTrackers);
+  setChecked('vkwave-autodaynight', s.autoDayNight);
+  const material = panel.querySelector('#vkwave-material');
+  if (material) material.value = s.backgroundMaterial || 'none';
+  const sleep = panel.querySelector('#vkwave-sleep');
+  if (sleep && !sleep.dataset.dirty) sleep.value = '0';
 }
 
 function buildPanel() {
@@ -941,6 +1434,60 @@ function buildPanel() {
   bindCheckbox('vkwave-hotkeys', 'hotkeys');
   bindCheckbox('vkwave-autolaunch', 'autoLaunch');
   bindCheckbox('vkwave-startintray', 'startInTray');
+  bindCheckbox('vkwave-ambient', 'ambientCover');
+  bindCheckbox('vkwave-vinyl', 'vinylMode');
+  bindCheckbox('vkwave-accentcover', 'accentFromCover');
+  bindCheckbox('vkwave-blocktrackers', 'blockTrackers');
+  bindCheckbox('vkwave-autodaynight', 'autoDayNight');
+
+  panel.querySelector('#vkwave-material').addEventListener('change', (e) => {
+    sendSettings({ backgroundMaterial: e.target.value });
+  });
+
+  panel.querySelector('#vkwave-lyrics-btn').addEventListener('click', () => {
+    togglePanel(); // прячем настройки, открываем текст
+    toggleLyrics(true);
+  });
+
+  const sleepSelect = panel.querySelector('#vkwave-sleep');
+  sleepSelect.addEventListener('change', async () => {
+    const minutes = Number(sleepSelect.value) || 0;
+    sleepSelect.dataset.dirty = minutes > 0 ? '1' : '';
+    const hint = panel.querySelector('#vkwave-mem');
+    try {
+      const endsAt = await ipcRenderer.invoke('sleep:set', minutes);
+      if (endsAt) {
+        const time = new Date(endsAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        if (hint) hint.textContent = `🌙 Музыка остановится в ${time}`;
+      } else if (hint) {
+        hint.textContent = '';
+      }
+    } catch (_) {
+      /* таймер недоступен */
+    }
+  });
+
+  panel.querySelector('#vkwave-mem-btn').addEventListener('click', async () => {
+    const box = panel.querySelector('#vkwave-mem');
+    if (!box) return;
+    box.textContent = 'Считаю…';
+    try {
+      const stats = await ipcRenderer.invoke('memory:stats');
+      if (!stats) {
+        box.textContent = 'Недоступно';
+        return;
+      }
+      const rows = stats.rows
+        .filter((r) => r.mb > 0)
+        .sort((a, b) => b.mb - a.mb)
+        .map((r) => `${r.type}: <b>${r.mb.toFixed(0)} МБ</b>`)
+        .join(' · ');
+      box.innerHTML =
+        `Всего: <b>${stats.total.toFixed(0)} МБ</b> · аптайм ${stats.appUptimeMin} мин<br>${rows}`;
+    } catch (_) {
+      box.textContent = 'Недоступно';
+    }
+  });
 
   panel.querySelector('#vkwave-close').addEventListener('click', () => togglePanel());
 
@@ -982,7 +1529,7 @@ async function sendSettings(patch) {
   try {
     const updated = await ipcRenderer.invoke('settings:set', patch);
     appSettings = updated;
-    applyTheme(updated);
+    applySettingsEffects(updated);
     syncPanel(updated);
   } catch (_) {
     /* настройки недоступны — изменения не сохранятся */
@@ -1018,6 +1565,10 @@ function setupHotkeys() {
       } else if (!event.ctrlKey && !event.altKey && !event.metaKey && event.code === 'Space') {
         event.preventDefault();
         handleTransportAction(state.isPlaying ? 'pause' : 'play');
+      } else if (!event.ctrlKey && !event.altKey && !event.metaKey && event.code === 'KeyL') {
+        // L — панель текста песни (караоке).
+        event.preventDefault();
+        toggleLyrics();
       }
     },
     true
@@ -1036,22 +1587,43 @@ function init() {
   ipcRenderer.on('settings-toggle', () => togglePanel());
   ipcRenderer.on('settings-updated', (_event, s) => {
     appSettings = s;
-    applyTheme(s);
+    applySettingsEffects(s);
     syncPanel(s);
   });
   ipcRenderer
     .invoke('settings:get')
     .then((s) => {
       appSettings = s;
-      applyTheme(s);
+      applySettingsEffects(s);
       syncPanel(s);
     })
     .catch(() => {});
+
+  // Обложка из main: dataURL для ambient + средний цвет для акцента.
+  ipcRenderer.on('cover-image', (_event, dataUrl) => onCoverImage(dataUrl));
+  ipcRenderer.on('cover-accent', (_event, hex) => {
+    state.coverAccent = hex || null;
+    if (appSettings) applyTheme(appSettings);
+  });
+
+  // Панель текста песни из трея.
+  ipcRenderer.on('lyrics-toggle', () => toggleLyrics());
+
+  // Sleep-таймер сработал — сообщаем в панели, если она открыта.
+  ipcRenderer.on('sleep-fired', () => {
+    const box = document.querySelector('#vkwave-mem');
+    if (box) box.textContent = '🌙 Sleep-таймер: музыка остановлена';
+  });
+
   buildPanel();
   setupHotkeys();
+  syncEffectClasses();
 
   runExtraction();
-  setInterval(runExtraction, POLL_INTERVAL_MS);
+  setInterval(() => {
+    runExtraction();
+    syncApState(); // время плеера ВК: караоке и живой прогресс в Discord
+  }, POLL_INTERVAL_MS);
 
   // Живая строка «0:33 / 2:15» в Discord: раз в 5 секунд обновляем время,
   // пока играет. Между обновлениями нативный таймер Discord тикает сам.
