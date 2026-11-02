@@ -13,12 +13,13 @@
  *  • Buttons — «Слушать в VK Музыке» и «Скачать VK Wave (GitHub)».
  *  • Если клиент Discord не запущен — переподключение каждые 15 секунд.
  *
- * Картинки — через ключи хранилища приложения (рендерятся всегда):
- *   1. Один раз залить logo/play/pause в портал (Rich Presence → Art Assets),
- *      либо задать DISCORD_CLIENT_SECRET — приложение зальёт их само.
- *   2. Обложка трека грузится динамически тем же способом, если задан
- *      DISCORD_CLIENT_SECRET (Bearer владельца / client_credentials / presign).
- *   3. Без ассетов карточка остаётся текстовой (без «?» вместо картинок).
+ * Картинки:
+ *   1. logo/play/pause — ключи хранилища приложения, если залиты в портал
+ *      (Rich Presence → Art Assets) или автоматически при DISCORD_CLIENT_SECRET.
+ *   2. Обложка трека грузится в хранилище динамически (Bearer владельца /
+ *      client_credentials / presign), если задан DISCORD_CLIENT_SECRET.
+ *   3. Без секрета большая картинка берётся из внешнего URL обложки, а
+ *      несуществующие ключи не отправляются — вместо серого «?».
  *
  * Свежие версии @xhayper/discord-rpc не имеют setActivity/clearActivity —
  * работаем через протокольные client.request('SET_ACTIVITY'|'CLEAR_ACTIVITY').
@@ -38,16 +39,14 @@ const OAUTH_TOKEN_URL = 'https://discord.com/api/oauth2/token';
 const ACTIVITY_TYPE_LISTENING = 2;
 
 const RECONNECT_INTERVAL_MS = 15 * 1000;
+const COVER_FAILURE_TTL_MS = 10 * 60 * 1000;
 const GITHUB_REPO_URL = 'https://github.com/mitherly/VK-Wave/releases/latest';
 const ASSETS_API = `https://discord.com/api/v9/applications/${CLIENT_ID}/assets`;
 
-/* Ассеты Rich Presence — ключи из хранилища приложения. Их нужно один раз
- * залить в портал (Rich Presence → Art Assets): logo, play, pause — и они
- * рендерятся в карточке всегда. Обложка трека — динамически через автоматическую
- * загрузку (DISCORD_CLIENT_SECRET), либо её не будет вовсе (чисто и без «?»). */
-const LOGO_ASSET_KEY = 'logo';
-const PLAY_ASSET_KEY = 'play';
-const PAUSE_ASSET_KEY = 'pause';
+/* Ассеты Rich Presence — ключи из хранилища приложения: logo, play, pause.
+ * Если они залиты в портал, карточка показывает их; если нет — большая
+ * картинка берётся из внешнего URL обложки, а маленькая не ставится вовсе,
+ * чтобы не получить серый «?». */
 
 const BUTTONS = [
   {
@@ -121,9 +120,15 @@ function bufferToDataUri(image) {
   return `data:${image.contentType};base64,${image.buffer.toString('base64')}`;
 }
 
-async function fetchImage(url) {
+async function fetchImage(url, headers = {}) {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Referer: 'https://vk.com/',
+        ...headers
+      }
+    });
     if (!response.ok) return null;
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.startsWith('image/')) return null;
@@ -161,16 +166,23 @@ function buildActivity(track, images) {
   const activity = {
     details: title,
     state: artist,
-    largeImageKey: (images && images.large) || LOGO_ASSET_KEY,
-    largeImageText: hasDuration
-      ? `${formatTime(track.currentTime)} / ${formatTime(track.duration)}`
-      : `${title} — ${artist}`.slice(0, 128),
-    smallImageKey:
-      (images && images.small) || (track.isPlaying ? PLAY_ASSET_KEY : PAUSE_ASSET_KEY),
-    smallImageText: track.isPlaying ? 'Воспроизводится' : 'Пауза',
     instance: false,
     buttons: BUTTONS
   };
+
+  // Картинку ставим только если она реально существует: ключ несуществующего
+  // ассета даёт в профиле серый «?». Без портала используем внешний URL
+  // обложки (Discord умеет его подтянуть), а без обложки — не ставим вовсе.
+  if (images && images.large) {
+    activity.largeImageKey = images.large;
+    activity.largeImageText = hasDuration
+      ? `${formatTime(track.currentTime)} / ${formatTime(track.duration)}`
+      : `${title} — ${artist}`.slice(0, 128);
+  }
+  if (images && images.small) {
+    activity.smallImageKey = images.small;
+    activity.smallImageText = track.isPlaying ? 'Воспроизводится' : 'Пауза';
+  }
 
   if (track.isPlaying && Number.isFinite(track.currentTime) && track.currentTime >= 0) {
     const startTimestamp = Date.now() - track.currentTime * 1000;
@@ -241,6 +253,8 @@ class DiscordPresence {
     this.rpcUserToken = null;       // Bearer-токен владельца (авторизация в Discord)
     this.triedConsentPrompt = false;
     this.uploadedCoverNames = new Map(); // url → имя ассета в портале
+    this.failedCovers = new Map();  // url → timestamp, когда можно повторить
+    this.updateGeneration = 0;      // защита от гонки асинхронных обновлений
     this.lastReconnectReason = null;
 
     this.client.on('ready', () => {
@@ -273,7 +287,7 @@ class DiscordPresence {
     if (this.clientSecret) {
       log('DISCORD_CLIENT_SECRET задан — обложки будут заливаться автоматически.');
     } else {
-      log('Ассеты-ключи: logo, play, pause (загрузи один раз в портал — см. README).');
+      log('Без секрета обложки идут внешними URL; logo/play/pause — если залиты в портал.');
     }
     this.connect();
   }
@@ -374,7 +388,13 @@ class DiscordPresence {
 
   /** logo/play/pause → хранилище приложения (один раз за запуск). */
   async ensurePortalKeys() {
-    if (!this.botToken && !this.clientSecret) return null;
+    if (!this.botToken && !this.clientSecret) {
+      // Ассеты могли залить вручную (Rich Presence → Art Assets). Без токена
+      // проверить это нельзя — доверяем только явному флагу.
+      return process.env.DISCORD_PORTAL_KEYS === '1'
+        ? { logo: 'logo', play: 'play', pause: 'pause' }
+        : null;
+    }
     if (this.portalKeysPromise) return this.portalKeysPromise;
     this.portalKeysPromise = (async () => {
       const errors = [];
@@ -493,13 +513,39 @@ class DiscordPresence {
     });
   }
 
+  /** Запоминаем неудачу на 10 минут, чтобы не долбить Discord/VK каждый апдейт. */
+  markCoverFailed(url) {
+    this.failedCovers.set(url, Date.now() + COVER_FAILURE_TTL_MS);
+    if (this.failedCovers.size > 100) {
+      this.failedCovers.delete(this.failedCovers.keys().next().value);
+    }
+  }
+
+  rememberCover(url, name) {
+    this.uploadedCoverNames.set(url, name);
+    if (this.uploadedCoverNames.size > 100) {
+      this.uploadedCoverNames.delete(this.uploadedCoverNames.keys().next().value);
+    }
+    return name;
+  }
+
   /** Обложка трека → ассет «cover_<hash>» в хранилище (дедуп по URL). */
   async uploadCoverAsAsset(url) {
     if ((!this.botToken && !this.clientSecret) || !url) return null;
     if (this.uploadedCoverNames.has(url)) return this.uploadedCoverNames.get(url);
+
+    const retryAt = this.failedCovers.get(url);
+    if (retryAt) {
+      if (retryAt > Date.now()) return null;
+      this.failedCovers.delete(url);
+    }
+
     try {
       const image = await fetchImage(url);
-      if (!image) return null;
+      if (!image) {
+        this.markCoverFailed(url);
+        return null;
+      }
       const name = `cover_${sha1Short(url)}`;
       const errors = [];
 
@@ -510,8 +556,7 @@ class DiscordPresence {
             name,
             image: bufferToDataUri(image)
           });
-          this.uploadedCoverNames.set(url, name);
-          return name;
+          return this.rememberCover(url, name);
         } catch (err) {
           errors.push(`owner-bearer: ${errText(err)}`);
         }
@@ -524,8 +569,7 @@ class DiscordPresence {
             name,
             image: bufferToDataUri(image)
           });
-          this.uploadedCoverNames.set(url, name);
-          return name;
+          return this.rememberCover(url, name);
         } catch (err) {
           errors.push(`Bearer: ${errText(err)}`);
         }
@@ -534,43 +578,59 @@ class DiscordPresence {
       if (this.botToken) {
         try {
           await this.uploadAsset(name, image);
-          this.uploadedCoverNames.set(url, name);
-          return name;
+          return this.rememberCover(url, name);
         } catch (err) {
           errors.push(`presign: ${errText(err)}`);
         }
       }
 
+      this.markCoverFailed(url);
       log('Обложка не загрузилась в портал (использую внешнюю ссылку):', errors.join(' | '));
       return null;
     } catch (err) {
+      this.markCoverFailed(url);
       log('Обложка не загрузилась в портал (использую внешнюю ссылку):', errText(err));
       return null;
     }
   }
 
-  /** Решает, какими ключами показывать картинки: порталные ключи
-   * logo/play/pause + обложка (если авто-загрузка удалась). */
+  /**
+   * Решает, какими картинками показывать трек:
+   *  • портал подтвердил logo/play/pause — используем ключи ассетов;
+   *  • портала нет — большая картинка = внешний URL обложки (без «?»),
+   *    маленькую иконку не ставим вовсе;
+   *  • обложка не залилась — остаётся logo (если он есть).
+   */
   async resolveImages(track) {
-    const images = {
-      large: LOGO_ASSET_KEY,
-      small: track.isPlaying ? PLAY_ASSET_KEY : PAUSE_ASSET_KEY
-    };
     const portal = await this.ensurePortalKeys();
-    if (portal) {
-      images.small = track.isPlaying ? portal.play : portal.pause;
-      images.large = portal.logo;
+    const images = {
+      large: (portal && portal.logo) || track.coverUrl || null,
+      small: portal ? (track.isPlaying ? portal.play : portal.pause) : null
+    };
+    if (track.coverUrl) {
+      const coverKey = await this.uploadCoverAsAsset(track.coverUrl);
+      if (coverKey) images.large = coverKey;
     }
-    const coverKey = await this.uploadCoverAsAsset(track.coverUrl);
-    if (coverKey) images.large = coverKey;
     return images;
   }
 
   async update(track) {
+    if (!track || (!track.title && !track.artist)) return;
+    const changed =
+      !this.lastTrack ||
+      this.lastTrack.title !== track.title ||
+      this.lastTrack.artist !== track.artist;
+    // Один неудачный апдейт не должен навсегда лишать трек иконки play/pause.
+    if (changed) this.degraded = false;
     this.lastTrack = track;
+
     if (!this.connected || isClientIdMissing) return;
+
+    const generation = ++this.updateGeneration;
     try {
       const images = await this.resolveImages(track);
+      // Пока грузили обложку, пришёл более новый трек — старую активность не шлём.
+      if (generation !== this.updateGeneration || !this.connected) return;
       const activity = buildActivity(track, images);
       if (!activity) return;
       this.sendActivity(activity);
@@ -657,6 +717,8 @@ class DiscordPresence {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    // Убираем карточку из профиля, а не просто рвём IPC.
+    this.clear();
     this.connected = false;
     try {
       this.client.destroy();
@@ -666,4 +728,4 @@ class DiscordPresence {
   }
 }
 
-module.exports = { DiscordPresence, buildActivity };
+module.exports = { DiscordPresence, buildActivity, CLIENT_ID };

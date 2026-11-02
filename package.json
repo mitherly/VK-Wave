@@ -1,7 +1,7 @@
 {
   "name": "vk-wave",
   "productName": "VK Wave",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Десктопный клиент VK Музыки с Discord Rich Presence, караоке-лириксом, волной в тайтлбаре и системным треем",
   "main": "main.js",
   "author": {
@@ -32,6 +32,8 @@
   },
   "scripts": {
     "start": "electron .",
+    "check": "node --check main.js && node --check preload.js && node --check discord.js && node --check tools/upload-discord-assets.js",
+    "test": "node --test",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win",
     "dist:portable": "electron-builder --win portable",
@@ -61,6 +63,7 @@
       "main.js",
       "preload.js",
       "discord.js",
+      "shared/**/*",
       "assets/**/*",
       "package.json"
     ],

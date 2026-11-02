@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /**
  * VK Wave — preload-перехватчик состояния плеера VK Музыки.
@@ -23,7 +23,7 @@ const { ipcRenderer, webFrame } = require('electron');
 const POLL_INTERVAL_MS = 750;          // период опроса MediaSession/DOM
 const MUTATION_DEBOUNCE_MS = 500;      // антидребезг MutationObserver
 const SEEK_THRESHOLD_SEC = 3;          // прыжок позиции больше этого — перемотка
-const KEEPALIVE_INTERVAL_MS = 120000;  // периодический ре-синк присутствия
+const KEEPALIVE_INTERVAL_MS = 60000;   // периодический ре-синк присутствия
 const FALLBACK_SCAN_INTERVAL_MS = 8000;// троттлинг тяжёлого поиска плеера
 
 /* ------------------------------- Состояние ------------------------------- */
@@ -352,6 +352,147 @@ function onTimeUpdate(event) {
   maybeSend();
 }
 
+
+/* -------------------- Web Audio API: EQ, Visualizer, Crossfade ---------------- */
+
+let audioCtx = null;
+let mediaSourceNode = null;
+let analyserNode = null;
+let eqFilters = [];
+let gainNode = null;
+const EQ_FREQUENCIES = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const EQ_PRESETS = {
+  flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  bass: [6, 5, 4, 2, 0, 0, 0, 1, 2, 3],
+  rock: [4, 3, 1, -1, -2, 0, 2, 4, 5, 5],
+  vocal: [-2, -2, -1, 1, 3, 4, 3, 2, 0, -1],
+  electronic: [5, 4, 2, 0, -1, 1, 2, 3, 4, 5]
+};
+
+function initAudioPipeline(mediaEl) {
+  if (!mediaEl) return;
+  try {
+    if (!audioCtx) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      audioCtx = new AudioContextClass();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+    if (mediaSourceNode) return; // уже подключён
+
+    mediaSourceNode = audioCtx.createMediaElementSource(mediaEl);
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 64;
+
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 1;
+
+    // 10-полосный эквалайзер
+    eqFilters = EQ_FREQUENCIES.map((freq, i) => {
+      const filter = audioCtx.createBiquadFilter();
+      if (i === 0) filter.type = 'lowshelf';
+      else if (i === EQ_FREQUENCIES.length - 1) filter.type = 'highshelf';
+      else filter.type = 'peaking';
+      filter.frequency.value = freq;
+      filter.Q.value = 1.4;
+      filter.gain.value = 0;
+      return filter;
+    });
+
+    // Соединяем цепочку: mediaSource -> eq0 -> eq1 ... -> eq9 -> gain -> analyser -> destination
+    let lastNode = mediaSourceNode;
+    for (const f of eqFilters) {
+      lastNode.connect(f);
+      lastNode = f;
+    }
+    lastNode.connect(gainNode);
+    gainNode.connect(analyserNode);
+    analyserNode.connect(audioCtx.destination);
+
+    applyEqSettings();
+    startWaveVisualizer();
+  } catch (_) {
+    // CORS ограничения на внешние аудиопотоки могут не позволить перехватить AudioContext
+  }
+}
+
+function applyEqSettings() {
+  if (!eqFilters.length) return;
+  const s = appSettings || {};
+  const isEnabled = !!s.eqEnabled;
+  const gains = Array.isArray(s.eqGains) && s.eqGains.length === 10
+    ? s.eqGains
+    : (EQ_PRESETS[s.eqPreset] || EQ_PRESETS.flat);
+
+  eqFilters.forEach((filter, i) => {
+    try {
+      filter.gain.value = isEnabled ? (Number(gains[i]) || 0) : 0;
+    } catch (_) {}
+  });
+}
+
+// Плавный кроссфейд при смене трека
+function triggerFadeIn() {
+  if (!gainNode || !audioCtx || !appSettings) return;
+  const dur = Number(appSettings.crossfadeDuration) || 0;
+  if (dur <= 0) {
+    gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
+    return;
+  }
+  try {
+    gainNode.gain.setValueAtTime(0.05, audioCtx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(1, audioCtx.currentTime + dur);
+  } catch (_) {}
+}
+
+// Визуализатор частот для тайтлбара
+let visualizerRaf = null;
+function startWaveVisualizer() {
+  if (visualizerRaf) return;
+  const data = new Uint8Array(32);
+  const loop = () => {
+    visualizerRaf = requestAnimationFrame(loop);
+    if (!state.isPlaying || !analyserNode || !appSettings || !appSettings.audioVisualizer) {
+      const wave = document.getElementById('vkwave-wave');
+      if (wave) wave.style.transform = 'scaleY(1)';
+      return;
+    }
+    analyserNode.getByteFrequencyData(data);
+    let sum = 0;
+    for (let i = 0; i < 16; i++) sum += data[i];
+    const avg = sum / 16; // 0..255
+    const scale = 0.7 + (avg / 255) * 0.9;
+    const wave = document.getElementById('vkwave-wave');
+    if (wave) wave.style.transform = `scaleY(${scale.toFixed(2)})`;
+  };
+  visualizerRaf = requestAnimationFrame(loop);
+}
+
+// Smart Resume: сохранение позиции трека
+function checkSmartResumeSave() {
+  if (!appSettings || !appSettings.smartResume || !state.title) return;
+  if (state.currentTime > 15 && state.duration > 180) {
+    try {
+      localStorage.setItem('vkwave_resume_' + trackKey(), String(Math.floor(state.currentTime)));
+    } catch (_) {}
+  }
+}
+
+function trySmartResumeRestore(el) {
+  if (!appSettings || !appSettings.smartResume || !el) return;
+  try {
+    const saved = localStorage.getItem('vkwave_resume_' + trackKey());
+    if (saved && Number(saved) > 10) {
+      const pos = Number(saved);
+      if (Math.abs(el.currentTime - pos) > 15) {
+        el.currentTime = pos;
+      }
+    }
+  } catch (_) {}
+}
+
 function setupMediaElementListeners() {
   document.addEventListener('play', onMediaPlay, true);
   document.addEventListener('pause', onMediaPause, true);
@@ -600,6 +741,7 @@ function sendTrackUpdate(now, payload) {
   // Визуальные эффекты и лирикс-префетч — следом за сводкой о треке.
   syncEffectClasses();
   if (appSettings && appSettings.vinylMode) applyVinyl();
+  updateFullscreenOverlay();
   if (payload.title && payload.artist && state.prefetchKey !== lyricsRequestId()) {
     requestLyrics(); // фоновой prefetch: панель откроется с готовым текстом
   }
@@ -659,7 +801,20 @@ const WAVE_CSS = `
     to   { transform: translateX(-240px); }
   }
   /* Винил-режим: обложка в плеере ВК становится пластинкой. */
+  
+  /* Винил с физикой остановки */
   .vkwave-vinyl {
+    border-radius: 50% !important;
+    animation: vkwave-spin 10s linear infinite;
+    animation-play-state: paused;
+    box-shadow: 0 4px 18px rgba(0,0,0,.6), inset 0 0 0 2px rgba(255,255,255,.15) !important;
+    transition: transform .8s cubic-bezier(.25, 1, .5, 1);
+  }
+  body.vkwave-playing .vkwave-vinyl {
+    animation-play-state: running;
+  }
+
+  .vkwave-vinyl-legacy {
     border-radius: 50% !important;
     animation: vkwave-spin 12s linear infinite;
     animation-play-state: paused;
@@ -679,6 +834,96 @@ const WAVE_CSS = `
     pointer-events: none;
   }
   body.vkwave-ambient-on #vkwave-ambient { opacity: .55; }
+
+  /* Чистый полноэкранный режим */
+  #vkwave-fullscreen-overlay {
+    position: fixed; inset: 0; z-index: 2147483645;
+    background: #0f0f13;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #fff; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    transition: opacity .3s ease;
+    opacity: 0; pointer-events: none;
+  }
+  body.vkwave-clean-fullscreen #vkwave-fullscreen-overlay {
+    opacity: 1; pointer-events: all;
+  }
+  .vkwave-fs__cover {
+    width: 280px; height: 280px; border-radius: 18px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.7); margin-bottom: 24px;
+    background-size: cover; background-position: center;
+  }
+  .vkwave-fs__title { font-size: 24px; font-weight: 700; margin-bottom: 6px; text-align: center; }
+  .vkwave-fs__artist { font-size: 16px; color: #a1a1aa; margin-bottom: 20px; }
+  .vkwave-fs__exit {
+    position: absolute; top: 16px; right: 20px;
+    background: rgba(255,255,255,.1); border: 0; color: #fff;
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 12px;
+  }
+  .vkwave-fs__exit:hover { background: rgba(255,255,255,.2); }
+
+
+  /* Кастомный фон и секретная тема */
+  #vkwave-custom-bg {
+    position: fixed; inset: 0; z-index: -2;
+    background-position: center; background-size: cover; background-repeat: no-repeat;
+    opacity: 0; transition: opacity .6s ease;
+    pointer-events: none;
+  }
+  body.vkwave-custombg-on #vkwave-custom-bg { opacity: 1; }
+
+  /* Оверлей разблокировки секретной темы */
+  #vkwave-secret-overlay {
+    position: fixed; inset: 0; z-index: 2147483647;
+    background: radial-gradient(circle at center, rgba(35, 12, 54, 0.94), rgba(10, 5, 20, 0.98));
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #fff; text-align: center; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    animation: vkwave-secret-pop .4s cubic-bezier(.175, .885, .32, 1.275);
+    backdrop-filter: blur(16px);
+  }
+  @keyframes vkwave-secret-pop {
+    from { opacity: 0; transform: scale(0.85); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  .vkwave-secret__badge {
+    font-size: 54px; margin-bottom: 12px;
+    animation: vkwave-secret-bounce 1s infinite alternate ease-in-out;
+  }
+  @keyframes vkwave-secret-bounce {
+    from { transform: translateY(0) scale(1); }
+    to { transform: translateY(-8px) scale(1.08); }
+  }
+  .vkwave-secret__title {
+    font-size: 26px; font-weight: 800; letter-spacing: .02em;
+    background: linear-gradient(135deg, #ff7eb6, #ff4db8, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+  }
+  .vkwave-secret__sub {
+    font-size: 18px; font-weight: 600; color: #e2d9f3; margin-bottom: 24px;
+    text-shadow: 0 2px 12px rgba(255, 77, 184, 0.4);
+  }
+  .vkwave-secret__hint {
+    font-size: 13px; color: rgba(255, 255, 255, 0.6);
+  }
+
+
+  /* Компактный режим: кнопка в тайтлбаре */
+  #vkwave-pip-btn {
+    position: fixed; top: 6px; left: 8px; z-index: 2147483647;
+    background: none; border: 0; color: rgba(255,255,255,.55); font-size: 13px;
+    cursor: pointer; padding: 2px 6px; border-radius: 6px; line-height: 1;
+    pointer-events: all; -webkit-app-region: no-drag;
+    transition: color .15s, background .15s;
+  }
+  #vkwave-pip-btn:hover { color: #fff; background: rgba(255,255,255,.1); }
+
+  #vkwave-ambient-b {
+    position: fixed; inset: -40px; z-index: -1;
+    background-position: center; background-size: cover;
+    filter: blur(52px) saturate(1.25);
+    transform: scale(1.1);
+    pointer-events: none;
+  }
 `;
 
 /** Ambient реально включён (есть и настройка, и обложка)? */
@@ -692,6 +937,79 @@ const WAVE_PATTERN_D =
   'M0 20 Q 15 12 30 20 T 60 20 T 90 20 T 120 20 T 150 20 T 180 20 T 210 20 T 240 20 L 240 34 L 0 34 Z';
 
 let waveEl = null;
+
+
+
+function showSecretUnlockBanner() {
+  const existing = document.getElementById('vkwave-secret-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'vkwave-secret-overlay';
+  overlay.innerHTML = `
+    <div class="vkwave-secret__badge">✨🌸✨</div>
+    <div class="vkwave-secret__title">Вы разблокировали секретную тему!</div>
+    <div class="vkwave-secret__sub">+rep wvunison</div>
+    <div class="vkwave-secret__hint">Нажмите в любое место или клавишу, чтобы закрыть</div>
+  `;
+
+  const close = () => {
+    overlay.style.transition = 'opacity .3s ease';
+    overlay.style.opacity = '0';
+    setTimeout(() => overlay.remove(), 300);
+    window.removeEventListener('keydown', close);
+  };
+
+  overlay.addEventListener('click', close);
+  window.addEventListener('keydown', close);
+  document.body.appendChild(overlay);
+}
+
+
+let fullscreenOverlayEl = null;
+
+function buildFullscreenOverlay() {
+  if (fullscreenOverlayEl && fullscreenOverlayEl.isConnected) return;
+  fullscreenOverlayEl = document.createElement('div');
+  fullscreenOverlayEl.id = 'vkwave-fullscreen-overlay';
+  fullscreenOverlayEl.innerHTML = `
+    <button class="vkwave-fs__exit">Выйти из полного экрана (Esc / F11)</button>
+    <div class="vkwave-fs__cover"></div>
+    <div class="vkwave-fs__title">Трек</div>
+    <div class="vkwave-fs__artist">Исполнитель</div>
+  `;
+  fullscreenOverlayEl.querySelector('.vkwave-fs__exit').addEventListener('click', () => toggleCleanFullscreen(false));
+  document.body.appendChild(fullscreenOverlayEl);
+}
+
+function updateFullscreenOverlay() {
+  if (!fullscreenOverlayEl) return;
+  const coverEl = fullscreenOverlayEl.querySelector('.vkwave-fs__cover');
+  const titleEl = fullscreenOverlayEl.querySelector('.vkwave-fs__title');
+  const artistEl = fullscreenOverlayEl.querySelector('.vkwave-fs__artist');
+  if (coverEl) coverEl.style.backgroundImage = state.coverUrl ? `url("${state.coverUrl}")` : 'none';
+  if (titleEl) titleEl.textContent = state.title || 'VK Музыка';
+  if (artistEl) artistEl.textContent = state.artist || 'Неизвестный исполнитель';
+}
+
+function toggleCleanFullscreen(force) {
+  buildFullscreenOverlay();
+  const active = typeof force === 'boolean' ? force : !document.body.classList.contains('vkwave-clean-fullscreen');
+  document.body.classList.toggle('vkwave-clean-fullscreen', active);
+  if (active) updateFullscreenOverlay();
+}
+
+function buildPipButton() {
+  if (document.getElementById('vkwave-pip-btn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'vkwave-pip-btn';
+  btn.title = 'Компактный режим (мини-плеер)';
+  btn.textContent = '⧉';
+  btn.addEventListener('click', () => {
+    ipcRenderer.invoke('window:toggle-pip').catch(() => {});
+  });
+  document.body.appendChild(btn);
+}
 
 function buildWave() {
   if (waveEl && waveEl.isConnected) return;
@@ -717,25 +1035,65 @@ function buildWave() {
 }
 
 let ambientEl = null;
+let ambientElB = null;
+let ambientFadeTimer = null;
+
+
+let customBgEl = null;
+
+function buildCustomBg() {
+  if (customBgEl && customBgEl.isConnected) return;
+  customBgEl = document.createElement('div');
+  customBgEl.id = 'vkwave-custom-bg';
+  document.body.appendChild(customBgEl);
+}
+
+function updateCustomBg(url) {
+  buildCustomBg();
+  if (customBgEl) {
+    if (url) {
+      customBgEl.style.backgroundImage = `linear-gradient(180deg, rgba(14,10,24,.4), rgba(14,10,24,.75)), url("${url}")`;
+      document.body.classList.add('vkwave-custombg-on');
+    } else {
+      customBgEl.style.backgroundImage = 'none';
+      document.body.classList.remove('vkwave-custombg-on');
+    }
+  }
+}
 
 function buildAmbient() {
   if (ambientEl && ambientEl.isConnected) return;
+  const gradient = 'linear-gradient(180deg, rgba(0,0,0,.32), rgba(0,0,0,.62))';
   ambientEl = document.createElement('div');
   ambientEl.id = 'vkwave-ambient';
-  const gradient =
-    'linear-gradient(180deg, rgba(0,0,0,.32), rgba(0,0,0,.62))';
   ambientEl.style.backgroundImage = `${gradient}, var(--vkwave-cover-image, none)`;
   document.body.appendChild(ambientEl);
+
+  ambientElB = document.createElement('div');
+  ambientElB.id = 'vkwave-ambient-b';
+  ambientElB.style.backgroundImage = gradient;
+  ambientElB.style.opacity = '0';
+  ambientElB.style.transition = 'opacity .9s ease';
+  document.body.appendChild(ambientElB);
 }
 
-/** Обложка пришла из main (dataURL): красим ambient-фон. */
+/** Обложка пришла из main (dataURL): плавный crossfade ambient-фона. */
 function onCoverImage(dataUrl) {
   if (!dataUrl) return;
   buildAmbient();
-  document.documentElement.style.setProperty(
-    '--vkwave-cover-image',
-    `url("${dataUrl}")`
-  );
+  if (ambientElB) {
+    const gradient = 'linear-gradient(180deg, rgba(0,0,0,.32), rgba(0,0,0,.62))';
+    ambientElB.style.backgroundImage = `${gradient}, url("${dataUrl}")`;
+    ambientElB.style.opacity = '0.55';
+    if (ambientFadeTimer) clearTimeout(ambientFadeTimer);
+    ambientFadeTimer = setTimeout(() => {
+      document.documentElement.style.setProperty('--vkwave-cover-image', `url("${dataUrl}")`);
+      if (ambientElB) ambientElB.style.opacity = '0';
+      ambientFadeTimer = null;
+    }, 900);
+  } else {
+    document.documentElement.style.setProperty('--vkwave-cover-image', `url("${dataUrl}")`);
+  }
   syncEffectClasses();
 }
 
@@ -746,6 +1104,9 @@ function syncEffectClasses() {
   // Волна включена по умолчанию; тумблера нет — она и есть «подпись» клиента.
   buildWave();
   document.body.classList.toggle('vkwave-wave-on', true);
+  buildPipButton();
+  if (s && s.customBackground) updateCustomBg(s.customBackground);
+  else updateCustomBg(null);
   document.body.classList.toggle(
     'vkwave-ambient-on',
     !!s.ambientCover && !!state.coverUrl
@@ -839,6 +1200,26 @@ const LYRICS_CSS = `
   }
   #vkwave-lyrics .vkwave-lyr--plain { color: #c6cbd4; padding: 2px 0; }
   #vkwave-lyrics .vkwave-lyrics__empty { color: #7d8590; padding: 18px 0; text-align: center; }
+
+  #vkwave-lyrics {
+    backdrop-filter: blur(20px) saturate(1.6) !important;
+    -webkit-backdrop-filter: blur(20px) saturate(1.6) !important;
+    background: rgba(20, 20, 24, 0.88) !important;
+    border: 1px solid rgba(255, 255, 255, 0.09) !important;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .65), 0 0 0 1px rgba(255, 255, 255, .04) inset !important;
+  }
+  #vkwave-lyrics .vkwave-lyr {
+    transition: all .2s ease;
+  }
+  #vkwave-lyrics .vkwave-lyr:hover {
+    background: rgba(255, 255, 255, .06) !important;
+  }
+  #vkwave-lyrics-copy-btn {
+    background: none; border: 0; color: #9aa0ab; font-size: 13px;
+    cursor: pointer; padding: 2px 6px; border-radius: 6px;
+    transition: color .15s, background .15s;
+  }
+  #vkwave-lyrics-copy-btn:hover { background: #232329; color: #fff; }
 `;
 
 let lyricsEl = null;
@@ -848,14 +1229,19 @@ let lyricsSyncTimer = null;
 
 function parseLrc(raw) {
   const lines = [];
-  for (const line of String(raw).split('\n')) {
-    const match = /^\s*\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?\]\s*(.*)$/.exec(line);
-    if (!match) continue;
-    const time =
-      Number(match[1]) * 60 +
-      Number(match[2]) +
-      (match[3] ? Number(`0.${match[3]}`) : 0);
-    lines.push({ time, text: match[4].trim() });
+  for (const rawLine of String(raw).split('\n')) {
+    // Строка может содержать несколько меток: [00:12.34][00:45.67]Текст.
+    const tagRe = /\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
+    const matches = Array.from(rawLine.matchAll(tagRe));
+    if (!matches.length) continue;
+    const text = rawLine.replace(tagRe, '').trim();
+    for (const match of matches) {
+      const time =
+        Number(match[1]) * 60 +
+        Number(match[2]) +
+        (match[3] ? Number(`0.${match[3]}`) : 0);
+      lines.push({ time, text });
+    }
   }
   lines.sort((a, b) => a.time - b.time);
   return lines;
@@ -890,6 +1276,7 @@ async function requestLyrics(force) {
     if (state.lyricsOpen) renderLyrics();
   } catch (_) {
     state.lyrics = null;
+    state.prefetchKey = null; // позволяем повторить запрос
   }
 }
 
@@ -962,14 +1349,35 @@ function buildLyricsPanel() {
   lyricsEl.className = 'vkwave-hidden';
   lyricsEl.innerHTML = `
     <div class="vkwave-lyrics__head">
-      <span class="vkwave-lyrics__title"> Lyrics </span>
-      <button class="vkwave-lyrics__x" title="Закрыть (L)">✕</button>
+      <span class="vkwave-lyrics__title"> 🎤 Lyrics </span>
+      <div style="display:flex;gap:4px;align-items:center">
+        <button id="vkwave-lyrics-copy-btn" title="Копировать текст песни">📋</button>
+        <button class="vkwave-lyrics__x" title="Закрыть (L)">✕</button>
+      </div>
     </div>
     <div class="vkwave-lyrics__body"></div>
   `;
   document.body.appendChild(lyricsEl);
   lyricsBodyEl = lyricsEl.querySelector('.vkwave-lyrics__body');
   lyricsEl.querySelector('.vkwave-lyrics__x').addEventListener('click', () => toggleLyrics());
+  const copyLyricsBtn = lyricsEl.querySelector('#vkwave-lyrics-copy-btn');
+  if (copyLyricsBtn) {
+    copyLyricsBtn.addEventListener('click', async () => {
+      try {
+        const lines = [];
+        if (state.lyrics && state.lyrics.synced) {
+          state.lyrics.synced.forEach((l) => lines.push(l.text));
+        } else if (state.lyrics && state.lyrics.plain) {
+          lines.push(state.lyrics.plain);
+        }
+        if (lines.length) {
+          await ipcRenderer.invoke('clipboard:write', lines.join('\n'));
+          copyLyricsBtn.textContent = '✓';
+          setTimeout(() => { copyLyricsBtn.textContent = '📋'; }, 1500);
+        }
+      } catch (_) {}
+    });
+  }
 }
 
 function toggleLyrics(forceOpen) {
@@ -1004,6 +1412,17 @@ function applySettingsEffects(s) {
   syncEffectClasses();
   if (s && s.vinylMode) applyVinyl();
   else disableVinyl();
+}
+
+/** Единая точка приёма настроек: main присылает их вместе с пресетами тем. */
+function applySettingsPayload(s) {
+  if (!s || typeof s !== 'object') return;
+  if (s.presets && typeof s.presets === 'object') {
+    THEME_PRESETS = s.presets;
+  }
+  appSettings = s;
+  applySettingsEffects(s);
+  syncPanel(s);
 }
 
 /* ----------------------- MutationObserver и команды ---------------------- */
@@ -1045,22 +1464,17 @@ function setupIpcCommands() {
 
 /* ------------------- Настройки, темы и панель управления ------------------ */
 
-const THEME_PRESETS = {
-  default: { background: '#141414', cards: '#1d1d22', accent: '#0077ff', radius: 16 },
-  oled: { background: '#000000', cards: '#101014', accent: '#0077ff', radius: 14 },
-  midnight: { background: '#0e1322', cards: '#172033', accent: '#5b8cff', radius: 18 },
-  light: { background: '#edeef0', cards: '#ffffff', accent: '#0077ff', radius: 16 },
-  sakura: { background: '#201622', cards: '#2b1f30', accent: '#ff7eb6', radius: 20 },
-  emerald: { background: '#0d1a13', cards: '#142520', accent: '#2ecc8f', radius: 16 },
-  lavender: { background: '#171225', cards: '#221b33', accent: '#a78bfa', radius: 18 },
-  amber: { background: '#1f1810', cards: '#2b2318', accent: '#ffb14a', radius: 16 },
-  cyberpunk: { background: '#0b0f14', cards: '#131a24', accent: '#00ffd5', radius: 12 },
-  ocean: { background: '#0b1b2a', cards: '#12283d', accent: '#38bdf8', radius: 18 },
-  graphite: { background: '#161719', cards: '#1f2124', accent: '#8e9aab', radius: 10 },
-  coffee: { background: '#191210', cards: '#241a15', accent: '#c98a5e', radius: 16 },
-  neon: { background: '#0d0a14', cards: '#161022', accent: '#e34fd0', radius: 14 },
-  halloween: { background: '#150d08', cards: '#221510', accent: '#ff7a1a', radius: 14 }
+/**
+ * Пресеты приходят из main вместе с настройками: preload в sandbox не может
+ * require'ить shared/theme.js. До первого ответа используем безопасный дефолт.
+ */
+const FALLBACK_THEME = {
+  background: '#141414',
+  cards: '#1d1d22',
+  accent: '#0077ff',
+  radius: 16
 };
+let THEME_PRESETS = { default: FALLBACK_THEME };
 
 /** Базовое переопределение (если скан токенов ВК ничего не нашёл). */
 function vkuiFallbackCss() {
@@ -1084,6 +1498,16 @@ function vkuiFallbackCss() {
     --vkui--size_border_radius: var(--vkwave-radius) !important;
   }
   body { background: var(--vkwave-bg) !important; }
+
+    /* Центрирование контента VK Музыки */
+    #audio, .audio_page, [class*="AudioPage"], [class*="MusicPage"], [id*="audio_page"] {
+      max-width: 1140px !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    .page_block {
+      max-width: none !important;
+    }
 `;
 }
 
@@ -1262,6 +1686,39 @@ const PANEL_CSS = `
   }
   #vkwave-panel .vkwave-mem { margin-top: 6px; font-size: 11.5px; color: #aab2bf; line-height: 1.7; }
   #vkwave-panel .vkwave-mem b { color: #e8eaf0; }
+
+  #vkwave-panel {
+    backdrop-filter: blur(20px) saturate(1.6) !important;
+    -webkit-backdrop-filter: blur(20px) saturate(1.6) !important;
+    background: rgba(20, 20, 24, 0.88) !important;
+    border: 1px solid rgba(255, 255, 255, 0.09) !important;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .65), 0 0 0 1px rgba(255, 255, 255, .04) inset !important;
+  }
+  #vkwave-panel .vkwave-panel__section {
+    padding: 6px 0 3px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    margin-bottom: 4px;
+    font-weight: 600;
+  }
+  #vkwave-panel .vkwave-chip {
+    transition: background .12s ease, transform .1s ease;
+  }
+  #vkwave-panel .vkwave-chip:hover {
+    transform: translateY(-1px);
+    background: #2e2e38 !important;
+  }
+  #vkwave-panel .vkwave-btn {
+    transition: background .12s ease, transform .1s ease;
+  }
+  #vkwave-panel .vkwave-btn:hover {
+    transform: translateY(-1px);
+  }
+  #vkwave-panel input[type="color"] {
+    transition: transform .1s ease;
+  }
+  #vkwave-panel input[type="color"]:hover {
+    transform: scale(1.08);
+  }
 `;
 
 const PANEL_HTML = `
@@ -1285,7 +1742,8 @@ const PANEL_HTML = `
     <button data-preset="graphite" class="vkwave-chip">🖤 Графит</button>
     <button data-preset="coffee" class="vkwave-chip">☕ Кофе</button>
     <button data-preset="neon" class="vkwave-chip">💜 Неон</button>
-    <button data-preset="halloween" class="vkwave-chip">🎃 Хэллоуин</button>
+        <button data-preset="halloween" class="vkwave-chip">🎃 Хэллоуин</button>
+    <button data-preset="anime" id="vkwave-chip-anime" class="vkwave-chip" style="display:none;background:linear-gradient(135deg, #ff4db8, #9d4edd);border:0;color:#fff;">✨ Аниме (Секретная)</button>
   </div>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autodaynight"> Авто день/ночь (Light ↔ Midnight)</label>
   <label class="vkwave-row">Фон окна <input type="color" id="vkwave-bg-input"></label>
@@ -1294,6 +1752,12 @@ const PANEL_HTML = `
   <label class="vkwave-row">Скругления <input type="range" id="vkwave-radius-input" min="0" max="32" step="2"></label>
 
   <div class="vkwave-panel__section">Внешний вид</div>
+    <label class="vkwave-row">Свой фон окна
+    <div style="display:flex;gap:6px;">
+      <button id="vkwave-bg-choose" class="vkwave-btn" style="padding:4px 8px;">Выбрать фото…</button>
+      <button id="vkwave-bg-clear" class="vkwave-btn vkwave-btn--ghost" style="padding:4px 8px;" title="Очистить фон">✕</button>
+    </div>
+  </label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-ambient"> Ambient-фон из обложки</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-vinyl"> Винил-режим обложки</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-accentcover"> Акцент из цвета обложки</label>
@@ -1305,15 +1769,51 @@ const PANEL_HTML = `
     </select>
   </label>
 
+  
+  <div class="vkwave-panel__section">Звук и эквалайзер</div>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-eq-enabled"> Включить эквалайзер</label>
+  <label class="vkwave-row">Пресет эквалайзера
+    <select id="vkwave-eq-preset">
+      <option value="flat">Обычный (Flat)</option>
+      <option value="bass">Усиление басов (Bass Boost)</option>
+      <option value="rock">Рок</option>
+      <option value="vocal">Вокал</option>
+      <option value="electronic">Электроника</option>
+    </select>
+  </label>
+  <label class="vkwave-row">Кроссфейд (плавный переход)
+    <select id="vkwave-crossfade">
+      <option value="0">Выключен</option>
+      <option value="1">1 секунда</option>
+      <option value="2">2 секунды</option>
+      <option value="3">3 секунды</option>
+      <option value="5">5 секунд</option>
+    </select>
+  </label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-smart-resume"> Запоминать позицию длинных треков</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-audio-viz"> Живая волна в тайтлбаре (спектр)</label>
+  <label class="vkwave-row">
+    <button id="vkwave-download-track" class="vkwave-btn">📥 Скачать текущий трек (MP3)</button>
+  </label>
+  <label class="vkwave-row">
+    <button id="vkwave-fs-btn" class="vkwave-btn">⛶ Чистый полноэкранный режим (F11)</button>
+  </label>
+
   <div class="vkwave-panel__section">Плеер</div>
   <label class="vkwave-row">
     <button id="vkwave-lyrics-btn" class="vkwave-btn">🎤 Текст песни (L)</button>
+  </label>
+  <label class="vkwave-row">
+    <button id="vkwave-copy-track" class="vkwave-btn">🔗 Копировать название трека</button>
   </label>
 
   <div class="vkwave-panel__section">Поведение</div>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-musiconly"> Только музыка</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-traycover"> Обложка в трее</label>
-  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-hotkeys"> Хоткеи (Space, Ctrl+←/→, L)</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-hotkeys"> Хоткеи в окне (Space, Ctrl+←/→, L)</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-globalhotkeys"> Глобальные хоткеи (Ctrl+Alt+Space/←/→)</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-notifications"> Всплывающие уведомления о треке</label>
+  <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-discord"> Discord Rich Presence</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autolaunch"> Запускать с Windows</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-startintray"> Стартовать в трее</label>
 
@@ -1363,7 +1863,8 @@ function syncPanel(s) {
   setValue('vkwave-bg-input', t.background);
   setValue('vkwave-cards-input', t.cards);
   setValue('vkwave-accent-input', t.accent);
-  setValue('vkwave-radius-input', Number(t.radius) || 16);
+  const radius = Number(t.radius);
+  setValue('vkwave-radius-input', Number.isFinite(radius) ? radius : 16);
   panel.querySelectorAll('[data-preset]').forEach((chip) => {
     chip.classList.toggle('vkwave-active', chip.dataset.preset === t.preset);
   });
@@ -1371,9 +1872,21 @@ function syncPanel(s) {
     const el = panel.querySelector(`#${id}`);
     if (el) el.checked = !!value;
   };
+  
+  setChecked('vkwave-eq-enabled', s.eqEnabled);
+  setChecked('vkwave-smart-resume', s.smartResume);
+  setChecked('vkwave-audio-viz', s.audioVisualizer);
+  const eqPresetEl = panel.querySelector('#vkwave-eq-preset');
+  if (eqPresetEl && s.eqPreset) eqPresetEl.value = s.eqPreset;
+  const crossfadeEl = panel.querySelector('#vkwave-crossfade');
+  if (crossfadeEl && typeof s.crossfadeDuration === 'number') crossfadeEl.value = String(s.crossfadeDuration);
+
   setChecked('vkwave-musiconly', s.musicOnly);
   setChecked('vkwave-traycover', s.trayCover);
   setChecked('vkwave-hotkeys', s.hotkeys);
+  setChecked('vkwave-globalhotkeys', s.globalHotkeys);
+  setChecked('vkwave-notifications', s.trackNotifications);
+  setChecked('vkwave-discord', s.discordRpc);
   setChecked('vkwave-autolaunch', s.autoLaunch);
   setChecked('vkwave-startintray', s.startInTray);
   setChecked('vkwave-ambient', s.ambientCover);
@@ -1404,11 +1917,14 @@ function buildPanel() {
   panel.querySelectorAll('[data-preset]').forEach((chip) => {
     chip.addEventListener('click', () => {
       const preset = chip.dataset.preset;
-      sendSettings({ theme: { ...THEME_PRESETS[preset], preset } });
+      // Если пресеты ещё не пришли из main — отправляем только имя:
+      // главный процесс сам подставит цвета пресета.
+      sendSettings({ theme: { ...(THEME_PRESETS[preset] || {}), preset } });
     });
   });
 
-  const currentTheme = () => (appSettings && appSettings.theme) || THEME_PRESETS.default;
+  const currentTheme = () =>
+    (appSettings && appSettings.theme) || THEME_PRESETS.default || FALLBACK_THEME;
 
   const bindColor = (id, key) => {
     const el = panel.querySelector(`#${id}`);
@@ -1429,9 +1945,40 @@ function buildPanel() {
     const el = panel.querySelector(`#${id}`);
     el.addEventListener('change', () => sendSettings({ [key]: el.checked }));
   };
+  
+  bindCheckbox('vkwave-eq-enabled', 'eqEnabled');
+  bindCheckbox('vkwave-smart-resume', 'smartResume');
+  bindCheckbox('vkwave-audio-viz', 'audioVisualizer');
+
+  const eqPresetSelect = panel.querySelector('#vkwave-eq-preset');
+  if (eqPresetSelect) {
+    eqPresetSelect.addEventListener('change', () => {
+      sendSettings({ eqPreset: eqPresetSelect.value });
+      applyEqSettings();
+    });
+  }
+
+  const crossfadeSelect = panel.querySelector('#vkwave-crossfade');
+  if (crossfadeSelect) {
+    crossfadeSelect.addEventListener('change', () => {
+      sendSettings({ crossfadeDuration: Number(crossfadeSelect.value) || 0 });
+    });
+  }
+
+  const fsBtn = panel.querySelector('#vkwave-fs-btn');
+  if (fsBtn) {
+    fsBtn.addEventListener('click', () => {
+      togglePanel();
+      toggleCleanFullscreen(true);
+    });
+  }
+
   bindCheckbox('vkwave-musiconly', 'musicOnly');
   bindCheckbox('vkwave-traycover', 'trayCover');
   bindCheckbox('vkwave-hotkeys', 'hotkeys');
+  bindCheckbox('vkwave-globalhotkeys', 'globalHotkeys');
+  bindCheckbox('vkwave-notifications', 'trackNotifications');
+  bindCheckbox('vkwave-discord', 'discordRpc');
   bindCheckbox('vkwave-autolaunch', 'autoLaunch');
   bindCheckbox('vkwave-startintray', 'startInTray');
   bindCheckbox('vkwave-ambient', 'ambientCover');
@@ -1443,6 +1990,68 @@ function buildPanel() {
   panel.querySelector('#vkwave-material').addEventListener('change', (e) => {
     sendSettings({ backgroundMaterial: e.target.value });
   });
+
+  
+  panel.querySelector('#vkwave-copy-track').addEventListener('click', async () => {
+    if (!state.title && !state.artist) return;
+    const text = `${state.artist || 'VK Музыка'} — ${state.title || 'Трек'}`;
+    try {
+      const ok = await ipcRenderer.invoke('clipboard:write', text);
+      if (ok) flashButton(panel, '#vkwave-copy-track', '✓ Скопировано');
+    } catch (_) {}
+  });
+
+  
+  const chooseBgBtn = panel.querySelector('#vkwave-bg-choose');
+  if (chooseBgBtn) {
+    chooseBgBtn.addEventListener('click', async () => {
+      try {
+        const dataUrl = await ipcRenderer.invoke('dialog:choose-image');
+        if (dataUrl) {
+          sendSettings({ customBackground: dataUrl });
+          flashButton(panel, '#vkwave-bg-choose', '✓ Установлено');
+        }
+      } catch (_) {}
+    });
+  }
+
+  const clearBgBtn = panel.querySelector('#vkwave-bg-clear');
+  if (clearBgBtn) {
+    clearBgBtn.addEventListener('click', () => {
+      sendSettings({ customBackground: '' });
+      flashButton(panel, '#vkwave-bg-choose', 'Очищено');
+    });
+  }
+
+  
+  const downloadTrackBtn = panel.querySelector('#vkwave-download-track');
+  if (downloadTrackBtn) {
+    downloadTrackBtn.addEventListener('click', async () => {
+      let audioUrl = state.activeMedia ? state.activeMedia.src : null;
+      if (!audioUrl) {
+        // Попытка взять url из первого audio на странице
+        const a = document.querySelector('audio');
+        if (a) audioUrl = a.src;
+      }
+      if (!audioUrl) {
+        flashButton(panel, '#vkwave-download-track', 'URL не найден');
+        return;
+      }
+      flashButton(panel, '#vkwave-download-track', 'Сохранение…');
+      try {
+        const res = await ipcRenderer.invoke('audio:download', {
+          url: audioUrl,
+          artist: state.artist,
+          title: state.title
+        });
+        if (res.success) flashButton(panel, '#vkwave-download-track', '✓ Сохранено');
+        else if (res.canceled) flashButton(panel, '#vkwave-download-track', 'Отменено');
+        else flashButton(panel, '#vkwave-download-track', 'Ошибка');
+      } catch (_) {
+        flashButton(panel, '#vkwave-download-track', 'Ошибка');
+      }
+    });
+  }
 
   panel.querySelector('#vkwave-lyrics-btn').addEventListener('click', () => {
     togglePanel(); // прячем настройки, открываем текст
@@ -1477,13 +2086,21 @@ function buildPanel() {
         box.textContent = 'Недоступно';
         return;
       }
-      const rows = stats.rows
+      box.innerHTML = '';
+      const totalLine = document.createElement('div');
+      totalLine.textContent = `Всего: ${stats.total.toFixed(0)} МБ · аптайм ${stats.appUptimeMin} мин`;
+      box.appendChild(totalLine);
+      const rowsWrap = document.createElement('div');
+      stats.rows
         .filter((r) => r.mb > 0)
         .sort((a, b) => b.mb - a.mb)
-        .map((r) => `${r.type}: <b>${r.mb.toFixed(0)} МБ</b>`)
-        .join(' · ');
-      box.innerHTML =
-        `Всего: <b>${stats.total.toFixed(0)} МБ</b> · аптайм ${stats.appUptimeMin} мин<br>${rows}`;
+        .forEach((r, idx, arr) => {
+          const span = document.createElement('span');
+          const safeType = String(r.type || 'proc').replace(/[<>'"&]/g, '');
+          span.textContent = `${safeType}: ${r.mb.toFixed(0)} МБ${idx < arr.length - 1 ? ' · ' : ''}`;
+          rowsWrap.appendChild(span);
+        });
+      box.appendChild(rowsWrap);
     } catch (_) {
       box.textContent = 'Недоступно';
     }
@@ -1493,7 +2110,11 @@ function buildPanel() {
 
   panel.querySelector('#vkwave-copy').addEventListener('click', async () => {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(appSettings.theme, null, 2));
+      const ok = await ipcRenderer.invoke(
+        'clipboard:write',
+        JSON.stringify(appSettings.theme, null, 2)
+      );
+      if (!ok) throw new Error('clipboard write failed');
       flashButton(panel, '#vkwave-copy', 'Скопировано ✓');
     } catch (_) {
       flashButton(panel, '#vkwave-copy', 'Не удалось');
@@ -1502,7 +2123,8 @@ function buildPanel() {
 
   panel.querySelector('#vkwave-paste').addEventListener('click', async () => {
     try {
-      const parsed = JSON.parse(await navigator.clipboard.readText());
+      const text = await ipcRenderer.invoke('clipboard:read');
+      const parsed = JSON.parse(text);
       if (!parsed || typeof parsed !== 'object') throw new Error('not a theme');
       sendSettings({ theme: { ...parsed, preset: 'custom' } });
       flashButton(panel, '#vkwave-paste', 'Загружено ✓');
@@ -1514,6 +2136,12 @@ function buildPanel() {
   panel.querySelector('#vkwave-reset').addEventListener('click', () => {
     sendSettings({ theme: { ...THEME_PRESETS.default, preset: 'default' } });
   });
+
+  
+  const animeChipEl = panel.querySelector('#vkwave-chip-anime');
+  if (animeChipEl) {
+    animeChipEl.style.display = (s.secretAnimeUnlocked || (t && t.preset === 'anime')) ? 'inline-block' : 'none';
+  }
 
   if (appSettings) syncPanel(appSettings);
 }
@@ -1527,10 +2155,7 @@ function togglePanel() {
 
 async function sendSettings(patch) {
   try {
-    const updated = await ipcRenderer.invoke('settings:set', patch);
-    appSettings = updated;
-    applySettingsEffects(updated);
-    syncPanel(updated);
+    applySettingsPayload(await ipcRenderer.invoke('settings:set', patch));
   } catch (_) {
     /* настройки недоступны — изменения не сохранятся */
   }
@@ -1549,12 +2174,57 @@ function isEditableTarget(target) {
   );
 }
 
+
+let cheatBuffer = '';
+const CHEAT_WORD = 'wvunison';
+
+function checkCheatCode(char) {
+  cheatBuffer += char.toLowerCase();
+  if (cheatBuffer.length > 20) cheatBuffer = cheatBuffer.slice(-20);
+  if (cheatBuffer.endsWith(CHEAT_WORD)) {
+    cheatBuffer = '';
+    unlockSecretAnimeTheme();
+  }
+}
+
+function unlockSecretAnimeTheme() {
+  const animeTheme = (THEME_PRESETS && THEME_PRESETS.anime) || {
+    background: '#120d1c', cards: '#1d152e', accent: '#ff4db8', radius: 18
+  };
+  sendSettings({
+    secretAnimeUnlocked: true,
+    theme: { ...animeTheme, preset: 'anime' }
+  });
+  showSecretUnlockBanner();
+}
+
 function setupHotkeys() {
   window.addEventListener(
     'keydown',
     (event) => {
       if (!appSettings || !appSettings.hotkeys) return;
       if (isEditableTarget(event.target)) return; // не мешаем печатать в поиске
+
+      // Проверка чит-кода
+      if (!event.ctrlKey && !event.altKey && !event.metaKey && event.key && event.key.length === 1) {
+        checkCheatCode(event.key);
+      }
+      // Также комбинация клавиш Ctrl+Shift+U для быстрого ввода
+      if (event.ctrlKey && event.shiftKey && (event.code === 'KeyU' || event.key.toLowerCase() === 'u')) {
+        event.preventDefault();
+        unlockSecretAnimeTheme();
+        return;
+      }
+
+
+      
+      if (event.code === 'F11') {
+        event.preventDefault();
+        toggleCleanFullscreen();
+      } else if (event.code === 'Escape' && document.body.classList.contains('vkwave-clean-fullscreen')) {
+        event.preventDefault();
+        toggleCleanFullscreen(false);
+      }
 
       if (event.ctrlKey && !event.shiftKey && !event.altKey && event.code === 'ArrowRight') {
         event.preventDefault();
@@ -1585,18 +2255,10 @@ function init() {
 
   // Настройки и панель VK Wave (Ctrl+Shift+T / пункт в трее).
   ipcRenderer.on('settings-toggle', () => togglePanel());
-  ipcRenderer.on('settings-updated', (_event, s) => {
-    appSettings = s;
-    applySettingsEffects(s);
-    syncPanel(s);
-  });
+  ipcRenderer.on('settings-updated', (_event, s) => applySettingsPayload(s));
   ipcRenderer
     .invoke('settings:get')
-    .then((s) => {
-      appSettings = s;
-      applySettingsEffects(s);
-      syncPanel(s);
-    })
+    .then((s) => applySettingsPayload(s))
     .catch(() => {});
 
   // Обложка из main: dataURL для ambient + средний цвет для акцента.
@@ -1609,10 +2271,15 @@ function init() {
   // Панель текста песни из трея.
   ipcRenderer.on('lyrics-toggle', () => toggleLyrics());
 
-  // Sleep-таймер сработал — сообщаем в панели, если она открыта.
+  // Sleep-таймер сработал — сообщаем в панели и сбрасываем селектор.
   ipcRenderer.on('sleep-fired', () => {
     const box = document.querySelector('#vkwave-mem');
     if (box) box.textContent = '🌙 Sleep-таймер: музыка остановлена';
+    const sleep = document.querySelector('#vkwave-sleep');
+    if (sleep) {
+      sleep.value = '0';
+      sleep.dataset.dirty = '';
+    }
   });
 
   buildPanel();
@@ -1624,14 +2291,8 @@ function init() {
     runExtraction();
     syncApState(); // время плеера ВК: караоке и живой прогресс в Discord
   }, POLL_INTERVAL_MS);
-
-  // Живая строка «0:33 / 2:15» в Discord: раз в 5 секунд обновляем время,
-  // пока играет. Между обновлениями нативный таймер Discord тикает сам.
-  setInterval(() => {
-    if (state.isPlaying && state.duration > 0 && state.title) {
-      sendTrackUpdate(Date.now(), buildPayload());
-    }
-  }, 5000);
+  // Прогресс в Discord анимирует сам клиент по start/end timestamps —
+  // частый SET_ACTIVITY не нужен. Долгий keepalive живёт в maybeSend().
 }
 
 if (document.readyState === 'loading') {
