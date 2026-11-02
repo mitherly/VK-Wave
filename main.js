@@ -204,6 +204,36 @@ function applyGlobalShortcuts() {
   if (settings.globalHotkeys) setupGlobalShortcuts();
 }
 
+
+function showWindowsToast(title, body, iconPath) {
+  if (process.platform !== 'win32') {
+    try { new Notification({ title, body, icon: iconPath }).show(); } catch (_) {}
+    return;
+  }
+  const cleanTitle = (title || 'VK Музыка').replace(/['"]/g, '');
+  const cleanBody = (body || '').replace(/['"]/g, '');
+  const psScript = `
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$template = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>${cleanTitle}</text>
+      <text>${cleanBody}</text>
+    </binding>
+  </visual>
+</toast>
+"@
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($template)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("VK Wave").Show($toast)
+`.trim();
+
+  execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', psScript], { windowsHide: true }, () => {});
+}
+
 function sendPlayerCommand(command) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('player-command', command);
@@ -962,7 +992,7 @@ function updateTray() {
       },
       { type: 'separator' },
       {
-        label: settings.discordRpc ? '🎮 Discord: вкл' : '🎮 Discord: выкл',
+        label: settings.discordRpc ? 'Discord: включен' : 'Discord: выключен',
         click: () => {
           settings = mergeSettings(settings, { discordRpc: !settings.discordRpc });
           scheduleSaveSettings();
@@ -974,7 +1004,7 @@ function updateTray() {
         }
       },
       {
-        label: '🔗 Копировать трек',
+        label: 'Копировать трек',
         enabled: !!(lastTrack && lastTrack.title),
         click: () => {
           if (lastTrack && lastTrack.title) {
@@ -1094,17 +1124,7 @@ if (!gotSingleInstanceLock) {
         const titleChanged = !prevTrack || prevTrack.title !== track.title || prevTrack.artist !== track.artist;
         if (titleChanged) {
           try {
-            try {
-              const n = new Notification({
-                title: track.artist || 'VK Музыка',
-                body: track.title || 'Неизвестный трек',
-                icon: path.join(__dirname, 'assets', 'logo.png'),
-                silent: false
-              });
-              n.show();
-            } catch (err) {
-              console.log('[VK Wave] Ошибка показа уведомления:', err && err.message);
-            }
+            showWindowsToast(track.artist || 'VK Музыка', track.title || 'Неизвестный трек', path.join(__dirname, 'assets', 'logo.png'));
           } catch (_) {}
         }
       }

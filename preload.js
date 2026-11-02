@@ -874,39 +874,19 @@ const WAVE_CSS = `
   }
   body.vkwave-custombg-on #vkwave-custom-bg { opacity: 1; }
 
-  /* Оверлей разблокировки секретной темы */
+  /* Нативный тост разблокировки темы */
   #vkwave-secret-overlay {
-    position: fixed; inset: 0; z-index: 2147483647;
-    background: radial-gradient(circle at center, rgba(35, 12, 54, 0.94), rgba(10, 5, 20, 0.98));
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    color: #fff; text-align: center; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-    animation: vkwave-secret-pop .4s cubic-bezier(.175, .885, .32, 1.275);
-    backdrop-filter: blur(16px);
+    position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+    background: #18191e; color: #f4f4f5;
+    border: 1px solid #27272a; border-radius: 8px;
+    padding: 10px 18px; font-size: 13px; font-weight: 500;
+    box-shadow: 0 10px 30px rgba(0,0,0,.45);
+    z-index: 2147483647; display: flex; align-items: center; gap: 10px;
+    transition: opacity .25s ease, transform .25s ease;
   }
-  @keyframes vkwave-secret-pop {
-    from { opacity: 0; transform: scale(0.85); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  .vkwave-secret__badge {
-    font-size: 54px; margin-bottom: 12px;
-    animation: vkwave-secret-bounce 1s infinite alternate ease-in-out;
-  }
-  @keyframes vkwave-secret-bounce {
-    from { transform: translateY(0) scale(1); }
-    to { transform: translateY(-8px) scale(1.08); }
-  }
-  .vkwave-secret__title {
-    font-size: 26px; font-weight: 800; letter-spacing: .02em;
-    background: linear-gradient(135deg, #ff7eb6, #ff4db8, #a78bfa);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    margin-bottom: 8px;
-  }
-  .vkwave-secret__sub {
-    font-size: 18px; font-weight: 600; color: #e2d9f3; margin-bottom: 24px;
-    text-shadow: 0 2px 12px rgba(255, 77, 184, 0.4);
-  }
-  .vkwave-secret__hint {
-    font-size: 13px; color: rgba(255, 255, 255, 0.6);
+  .vkwave-secret__tag {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: #a1a1aa; background: #27272a; padding: 2px 6px; border-radius: 4px;
   }
 
 
@@ -950,22 +930,16 @@ function showSecretUnlockBanner() {
   const overlay = document.createElement('div');
   overlay.id = 'vkwave-secret-overlay';
   overlay.innerHTML = `
-    <div class="vkwave-secret__badge">✨🌸✨</div>
-    <div class="vkwave-secret__title">Вы разблокировали секретную тему!</div>
-    <div class="vkwave-secret__sub">+rep wvunison</div>
-    <div class="vkwave-secret__hint">Нажмите в любое место или клавишу, чтобы закрыть</div>
+    <span class="vkwave-secret__tag">Секрет</span>
+    <span>Разблокирована тема Anime · <b>+rep wvunison</b></span>
   `;
-
-  const close = () => {
-    overlay.style.transition = 'opacity .3s ease';
-    overlay.style.opacity = '0';
-    setTimeout(() => overlay.remove(), 300);
-    window.removeEventListener('keydown', close);
-  };
-
-  overlay.addEventListener('click', close);
-  window.addEventListener('keydown', close);
   document.body.appendChild(overlay);
+
+  setTimeout(() => {
+    overlay.style.opacity = '0';
+    overlay.style.transform = 'translate(-50%, 8px)';
+    setTimeout(() => overlay.remove(), 250);
+  }, 3500);
 }
 
 
@@ -1372,9 +1346,9 @@ function buildLyricsPanel() {
   lyricsEl.className = 'vkwave-hidden';
   lyricsEl.innerHTML = `
     <div class="vkwave-lyrics__head">
-      <span class="vkwave-lyrics__title"> 🎤 Lyrics </span>
+      <span class="vkwave-lyrics__title">Текст песни</span>
       <div style="display:flex;gap:4px;align-items:center">
-        <button id="vkwave-lyrics-copy-btn" title="Копировать текст песни">📋</button>
+        <button id="vkwave-lyrics-copy-btn" title="Копировать текст">Копировать</button>
         <button class="vkwave-lyrics__x" title="Закрыть (L)">✕</button>
       </div>
     </div>
@@ -1395,8 +1369,8 @@ function buildLyricsPanel() {
         }
         if (lines.length) {
           await ipcRenderer.invoke('clipboard:write', lines.join('\n'));
-          copyLyricsBtn.textContent = '✓';
-          setTimeout(() => { copyLyricsBtn.textContent = '📋'; }, 1500);
+          copyLyricsBtn.textContent = 'Скопировано';
+          setTimeout(() => { copyLyricsBtn.textContent = 'Копировать'; }, 1500);
         }
       } catch (_) {}
     });
@@ -1746,7 +1720,7 @@ const PANEL_CSS = `
 
 const PANEL_HTML = `
   <div class="vkwave-panel__head">
-    <span class="vkwave-panel__title">🌊 VK Wave · Настройки</span>
+    <span class="vkwave-panel__title">Настройки VK Wave</span>
     <button id="vkwave-close" class="vkwave-panel__x" title="Закрыть (Ctrl+Shift+T)">✕</button>
   </div>
 
@@ -1756,17 +1730,17 @@ const PANEL_HTML = `
     <button data-preset="oled" class="vkwave-chip">OLED</button>
     <button data-preset="midnight" class="vkwave-chip">Midnight</button>
     <button data-preset="light" class="vkwave-chip">Light</button>
-    <button data-preset="sakura" class="vkwave-chip">🌸 Сакура</button>
-    <button data-preset="emerald" class="vkwave-chip">💚 Изумруд</button>
-    <button data-preset="lavender" class="vkwave-chip">💜 Лаванда</button>
-    <button data-preset="amber" class="vkwave-chip">🧡 Янтарная</button>
-    <button data-preset="cyberpunk" class="vkwave-chip">🤖 Киберпанк</button>
-    <button data-preset="ocean" class="vkwave-chip">🌊 Океан</button>
-    <button data-preset="graphite" class="vkwave-chip">🖤 Графит</button>
-    <button data-preset="coffee" class="vkwave-chip">☕ Кофе</button>
-    <button data-preset="neon" class="vkwave-chip">💜 Неон</button>
-        <button data-preset="halloween" class="vkwave-chip">🎃 Хэллоуин</button>
-    <button data-preset="anime" id="vkwave-chip-anime" class="vkwave-chip" style="display:none;background:linear-gradient(135deg, #ff4db8, #9d4edd);border:0;color:#fff;">✨ Аниме (Секретная)</button>
+    <button data-preset="sakura" class="vkwave-chip">Sakura</button>
+    <button data-preset="emerald" class="vkwave-chip">Emerald</button>
+    <button data-preset="lavender" class="vkwave-chip">Lavender</button>
+    <button data-preset="amber" class="vkwave-chip">Amber</button>
+    <button data-preset="cyberpunk" class="vkwave-chip">Cyberpunk</button>
+    <button data-preset="ocean" class="vkwave-chip">Ocean</button>
+    <button data-preset="graphite" class="vkwave-chip">Graphite</button>
+    <button data-preset="coffee" class="vkwave-chip">Coffee</button>
+    <button data-preset="neon" class="vkwave-chip">Neon</button>
+        <button data-preset="halloween" class="vkwave-chip">Halloween</button>
+    <button data-preset="anime" id="vkwave-chip-anime" class="vkwave-chip" style="display:none;background:#2d1b38;color:#f472b6;border:1px solid #3b2149;">Anime</button>
   </div>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-autodaynight"> Авто день/ночь (Light ↔ Midnight)</label>
   <label class="vkwave-row">Фон окна <input type="color" id="vkwave-bg-input"></label>
@@ -1816,18 +1790,18 @@ const PANEL_HTML = `
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-smart-resume"> Запоминать позицию длинных треков</label>
   <label class="vkwave-row vkwave-check"><input type="checkbox" id="vkwave-audio-viz"> Живая волна в тайтлбаре (спектр)</label>
   <label class="vkwave-row">
-    <button id="vkwave-download-track" class="vkwave-btn">📥 Скачать текущий трек (MP3)</button>
+    <button id="vkwave-download-track" class="vkwave-btn">Сохранить трек (MP3)</button>
   </label>
   <label class="vkwave-row">
-    <button id="vkwave-fs-btn" class="vkwave-btn">⛶ Чистый полноэкранный режим (F11)</button>
+    <button id="vkwave-fs-btn" class="vkwave-btn">Полноэкранный режим (F11)</button>
   </label>
 
   <div class="vkwave-panel__section">Плеер</div>
   <label class="vkwave-row">
-    <button id="vkwave-lyrics-btn" class="vkwave-btn">🎤 Текст песни (L)</button>
+    <button id="vkwave-lyrics-btn" class="vkwave-btn">Текст песни (L)</button>
   </label>
   <label class="vkwave-row">
-    <button id="vkwave-copy-track" class="vkwave-btn">🔗 Копировать название трека</button>
+    <button id="vkwave-copy-track" class="vkwave-btn">Скопировать название трека</button>
   </label>
 
   <div class="vkwave-panel__section">Поведение</div>
@@ -1852,7 +1826,7 @@ const PANEL_HTML = `
     </select>
   </label>
   <div class="vkwave-row">
-    <button id="vkwave-mem-btn" class="vkwave-btn">📊 Память</button>
+    <button id="vkwave-mem-btn" class="vkwave-btn">Состояние памяти</button>
   </div>
   <div id="vkwave-mem" class="vkwave-mem"></div>
 
@@ -1861,7 +1835,7 @@ const PANEL_HTML = `
     <button id="vkwave-paste" class="vkwave-btn">Вставить</button>
     <button id="vkwave-reset" class="vkwave-btn vkwave-btn--ghost">Сброс</button>
   </div>
-  <div class="vkwave-panel__hint">Тема перекрашивает все цветовые токены VKUI. Волна в тайтлбаре пляшет, пока играет музыка 🌊. Эффект окна — экспериментальный, только Win 11.</div>
+  <div class="vkwave-panel__hint">Тема перекрашивает все цветовые токены VKUI. Волна в тайтлбаре отображает активность аудио. Эффект окна — экспериментальный, только Win 11.</div>
 `;
 
 function flashButton(panel, selector, text) {
@@ -2090,7 +2064,7 @@ function buildPanel() {
       const endsAt = await ipcRenderer.invoke('sleep:set', minutes);
       if (endsAt) {
         const time = new Date(endsAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        if (hint) hint.textContent = `🌙 Музыка остановится в ${time}`;
+        if (hint) hint.textContent = `Таймер остановки: ${time}`;
       } else if (hint) {
         hint.textContent = '';
       }
@@ -2305,7 +2279,7 @@ function init() {
   // Sleep-таймер сработал — сообщаем в панели и сбрасываем селектор.
   ipcRenderer.on('sleep-fired', () => {
     const box = document.querySelector('#vkwave-mem');
-    if (box) box.textContent = '🌙 Sleep-таймер: музыка остановлена';
+    if (box) box.textContent = 'Sleep-таймер: воспроизведение остановлено';
     const sleep = document.querySelector('#vkwave-sleep');
     if (sleep) {
       sleep.value = '0';
