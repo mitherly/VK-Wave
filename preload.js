@@ -438,13 +438,16 @@ function triggerFadeIn() {
   if (!gainNode || !audioCtx || !appSettings) return;
   const dur = Number(appSettings.crossfadeDuration) || 0;
   if (dur <= 0) {
-    gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
+    try { gainNode.gain.setValueAtTime(1, audioCtx.currentTime); } catch (_) {}
     return;
   }
   try {
-    gainNode.gain.setValueAtTime(0.05, audioCtx.currentTime);
-    gainNode.gain.linearRampToValueAtTime(1, audioCtx.currentTime + dur);
-  } catch (_) {}
+    // Мягкий фейд-ин только при начале воспроизведения
+    gainNode.gain.setValueAtTime(0.01, audioCtx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(1, audioCtx.currentTime + dur);
+  } catch (_) {
+    try { gainNode.gain.setValueAtTime(1, audioCtx.currentTime); } catch (_) {}
+  }
 }
 
 // Визуализатор частот для тайтлбара
@@ -987,9 +990,29 @@ function updateFullscreenOverlay() {
   const coverEl = fullscreenOverlayEl.querySelector('.vkwave-fs__cover');
   const titleEl = fullscreenOverlayEl.querySelector('.vkwave-fs__title');
   const artistEl = fullscreenOverlayEl.querySelector('.vkwave-fs__artist');
-  if (coverEl) coverEl.style.backgroundImage = state.coverUrl ? `url("${state.coverUrl}")` : 'none';
+  
+  // Пытаемся получить обложку из state.coverUrl, либо из DOM плеера напрямую
+  let cover = state.coverUrl;
+  if (!cover) {
+    const root = findPlayerRoot();
+    if (root) cover = readCoverFromDom(root);
+  }
+  if (!cover) {
+    const anyImg = document.querySelector('img[src*="userapi.com"], img[src*="vk-cdn"]');
+    if (anyImg) cover = anyImg.currentSrc || anyImg.src;
+  }
+
+  if (coverEl) {
+    if (cover) {
+      coverEl.style.backgroundImage = `url("${cover}")`;
+      coverEl.style.display = 'block';
+    } else {
+      coverEl.style.backgroundImage = 'none';
+      coverEl.style.backgroundColor = 'var(--vkwave-cards, #1d1d22)';
+    }
+  }
   if (titleEl) titleEl.textContent = state.title || 'VK Музыка';
-  if (artistEl) artistEl.textContent = state.artist || 'Неизвестный исполнитель';
+  if (artistEl) artistEl.textContent = state.artist || 'Воспроизведение';
 }
 
 function toggleCleanFullscreen(force) {
@@ -2178,8 +2201,11 @@ function isEditableTarget(target) {
 let cheatBuffer = '';
 const CHEAT_WORD = 'wvunison';
 
-function checkCheatCode(char) {
-  cheatBuffer += char.toLowerCase();
+function checkCheatCode(key) {
+  if (!key || typeof key !== 'string') return;
+  const lower = key.toLowerCase();
+  const latin = russianToEnglish[lower] || lower;
+  cheatBuffer += latin;
   if (cheatBuffer.length > 20) cheatBuffer = cheatBuffer.slice(-20);
   if (cheatBuffer.endsWith(CHEAT_WORD)) {
     cheatBuffer = '';
@@ -2205,15 +2231,20 @@ function setupHotkeys() {
       if (!appSettings || !appSettings.hotkeys) return;
       if (isEditableTarget(event.target)) return; // не мешаем печатать в поиске
 
-      // Проверка чит-кода
-      if (!event.ctrlKey && !event.altKey && !event.metaKey && event.key && event.key.length === 1) {
-        checkCheatCode(event.key);
-      }
-      // Также комбинация клавиш Ctrl+Shift+U для быстрого ввода
-      if (event.ctrlKey && event.shiftKey && (event.code === 'KeyU' || event.key.toLowerCase() === 'u')) {
+      // Проверка комбинаций разблокировки (Ctrl+Shift+U или Ctrl+Alt+U)
+      if (
+        (event.ctrlKey && event.shiftKey && (event.code === 'KeyU' || event.key.toLowerCase() === 'u' || event.key.toLowerCase() === 'г')) ||
+        (event.ctrlKey && event.altKey && (event.code === 'KeyU' || event.key.toLowerCase() === 'u' || event.key.toLowerCase() === 'г'))
+      ) {
         event.preventDefault();
+        event.stopPropagation();
         unlockSecretAnimeTheme();
         return;
+      }
+
+      // Проверка побуквенного ввода
+      if (!event.ctrlKey && !event.altKey && !event.metaKey && event.key && event.key.length === 1) {
+        checkCheatCode(event.key);
       }
 
 

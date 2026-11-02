@@ -560,8 +560,17 @@ function createWindow() {
 
   const startHidden = process.argv.includes('--hidden') || settings.startInTray;
   mainWindow.once('ready-to-show', () => {
-    if (!startHidden) mainWindow.show();
+    if (!startHidden) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
   });
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible() && !startHidden) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  }, 1200);
 
   // Крестик сворачивает окно в трей, а не закрывает приложение.
   mainWindow.on('close', (event) => {
@@ -575,6 +584,9 @@ function createWindow() {
     mainWindow = null;
   });
 
+    mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.log('[VK Wave] did-fail-load:', errorCode, errorDescription, validatedURL);
+  });
   mainWindow.webContents.on('did-finish-load', injectTitleBarStyles);
 
   // Полная навигация уничтожает вставленный CSS, но ключ insertCSS остаётся
@@ -1052,7 +1064,7 @@ if (!gotSingleInstanceLock) {
   app.on('second-instance', () => showMainWindow());
 
   app.whenReady().then(() => {
-    app.setAppUserModelId('ru.vkwave.desktop');
+    try { app.setAppUserModelId(process.execPath); } catch (_) {}
 
     loadSettings();
     applyAutoLaunch();
@@ -1082,13 +1094,16 @@ if (!gotSingleInstanceLock) {
         const titleChanged = !prevTrack || prevTrack.title !== track.title || prevTrack.artist !== track.artist;
         if (titleChanged) {
           try {
-            if (Notification.isSupported()) {
-              new Notification({
+            try {
+              const n = new Notification({
                 title: track.artist || 'VK Музыка',
                 body: track.title || 'Неизвестный трек',
                 icon: path.join(__dirname, 'assets', 'logo.png'),
-                silent: true
-              }).show();
+                silent: false
+              });
+              n.show();
+            } catch (err) {
+              console.log('[VK Wave] Ошибка показа уведомления:', err && err.message);
             }
           } catch (_) {}
         }
