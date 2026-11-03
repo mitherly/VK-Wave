@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 /**
  * VK Wave — preload-перехватчик состояния плеера VK Музыки.
@@ -1865,6 +1865,10 @@ function syncPanel(s) {
   panel.querySelectorAll('[data-preset]').forEach((chip) => {
     chip.classList.toggle('vkwave-active', chip.dataset.preset === t.preset);
   });
+  const animeChip = panel.querySelector('#vkwave-chip-anime');
+  if (animeChip) {
+    animeChip.style.display = (s.secretAnimeUnlocked || (t && t.preset === 'anime')) ? 'inline-block' : 'none';
+  }
   const setChecked = (id, value) => {
     const el = panel.querySelector(`#${id}`);
     if (el) el.checked = !!value;
@@ -2137,7 +2141,9 @@ function buildPanel() {
   
   const animeChipEl = panel.querySelector('#vkwave-chip-anime');
   if (animeChipEl) {
-    animeChipEl.style.display = (s.secretAnimeUnlocked || (t && t.preset === 'anime')) ? 'inline-block' : 'none';
+    const curTheme = (appSettings && appSettings.theme) || {};
+    const isUnlocked = !!(appSettings && appSettings.secretAnimeUnlocked);
+    animeChipEl.style.display = (isUnlocked || curTheme.preset === 'anime') ? 'inline-block' : 'none';
   }
 
   if (appSettings) syncPanel(appSettings);
@@ -2172,13 +2178,20 @@ function isEditableTarget(target) {
 }
 
 
+const RUSSIAN_TO_ENGLISH_KEYMAP = {
+  'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i',
+  'щ': 'o', 'з': 'p', 'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f',
+  'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k', 'д': 'l', 'ж': ';', 'э': '\'', 'я': 'z',
+  'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm', 'б': ',', 'ю': '.'
+};
+
 let cheatBuffer = '';
 const CHEAT_WORD = 'wvunison';
 
 function checkCheatCode(key) {
   if (!key || typeof key !== 'string') return;
   const lower = key.toLowerCase();
-  const latin = russianToEnglish[lower] || lower;
+  const latin = RUSSIAN_TO_ENGLISH_KEYMAP[lower] || lower;
   cheatBuffer += latin;
   if (cheatBuffer.length > 20) cheatBuffer = cheatBuffer.slice(-20);
   if (cheatBuffer.endsWith(CHEAT_WORD)) {

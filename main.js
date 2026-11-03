@@ -205,13 +205,22 @@ function applyGlobalShortcuts() {
 }
 
 
+function escapeXml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 function showWindowsToast(title, body, iconPath) {
   if (process.platform !== 'win32') {
     try { new Notification({ title, body, icon: iconPath }).show(); } catch (_) {}
     return;
   }
-  const cleanTitle = (title || 'VK Музыка').replace(/['"]/g, '');
-  const cleanBody = (body || '').replace(/['"]/g, '');
+  const cleanTitle = escapeXml(title || 'VK Музыка');
+  const cleanBody = escapeXml(body || '');
   const psScript = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
@@ -738,7 +747,7 @@ const MUSIC_ONLY_CSS = `
 `;
 
 /** Страницы, которые нельзя ломать редиректом «Только музыка». */
-const MUSIC_ONLY_BYPASS_PATHS = /^\/(login|oauth|authorize|join|away|dev|api|download|faq|support)\b/i;
+const MUSIC_ONLY_BYPASS_PATHS = /^\/(login|oauth|authorize|join|away|dev|api|download|faq|support|restore|security|verify|checkpoint|activation|blocked)\b/i;
 const VK_MAIN_HOSTS = new Set(['vk.com', 'www.vk.com', 'm.vk.com', 'vk.ru', 'www.vk.ru', 'm.vk.ru']);
 
 function enforceMusicOnly(url) {
@@ -749,16 +758,15 @@ function enforceMusicOnly(url) {
   } catch (_) {
     return;
   }
-  // Субдомены (login.vk.com, id.vk.com, oauth.vk.com) и внешние хосты
-  // не трогаем — иначе сломаем авторизацию и OAuth-попапы.
+  // Субдомены (login.vk.com, id.vk.com, oauth.vk.com, connect.vk.com) и внешние хосты
+  // не трогаем — иначе сломаем авторизацию, разблокировку и OAuth-попапы.
   if (!VK_MAIN_HOSTS.has(parsed.hostname.toLowerCase())) return;
   // Музыкальный раздел (включая альбомы и страницы артистов) — можно.
   if (/^\/(music|artist|audio)/i.test(parsed.pathname)) return;
-  // Служебные страницы VK (логин, OAuth, поддержка) — можно.
+  // Служебные страницы VK (логин, разблокировка/заморозка, OAuth, поддержка) — можно.
   if (MUSIC_ONLY_BYPASS_PATHS.test(parsed.pathname) || /\.php$/i.test(parsed.pathname)) return;
-  // Вход и внутренние редиректы VK иногда идут на корень с ?act=login,
-  // ?oauth=... или ?u=...&to=<base64-путь> — не ломаем их.
-  if (/[?&](?:act=login|login|oauth|authorize|to|u)\b/i.test(parsed.search)) return;
+  // Вход, блокировка и внутренние редиректы VK (например ?act=blocked, ?act=security, ?act=restore, to=...)
+  if (/[?&](?:act|login|oauth|authorize|to|u|verify|security)\b/i.test(parsed.search)) return;
 
   redirectingToMusic = true;
   mainWindow.webContents
@@ -841,6 +849,9 @@ function applySettingsToWindow() {
   ) {
     applyAutoLaunch();
   }
+  if (!prev || prev.globalHotkeys !== settings.globalHotkeys) {
+    applyGlobalShortcuts();
+  }
 
   appliedMainSettings = {
     background: settings.theme.background,
@@ -848,7 +859,8 @@ function applySettingsToWindow() {
     trayCover: settings.trayCover,
     musicOnly: settings.musicOnly,
     autoLaunch: settings.autoLaunch,
-    startInTray: settings.startInTray
+    startInTray: settings.startInTray,
+    globalHotkeys: settings.globalHotkeys
   };
 }
 
@@ -997,8 +1009,7 @@ function updateTray() {
           settings = mergeSettings(settings, { discordRpc: !settings.discordRpc });
           scheduleSaveSettings();
           syncDiscord();
-      applyGlobalShortcuts();
-      broadcastSettings();
+          broadcastSettings();
           trayMenuKey = null;
           updateTray();
         }
